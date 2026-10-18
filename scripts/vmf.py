@@ -25,10 +25,12 @@ Design constraints that this module is built around (see SKILL.md):
   * Line endings are detected per file (Hammer++ writes LF even in CRLF repos)
     and restored on write.
 
-The module is both a library (parse/load/serialize/save + the Node/KV model)
-and a CLI: `python vmf.py --help` lists the read (stats/find/get/io-graph/refs),
-validate (lint/roundtrip), edit (set-kv/add-io/rm-io/replace-material/move) and
-generate (new-id/box/add-entity) commands.
+The module is both a library (parse/load/serialize/save + the Node/KV model +
+brush geometry) and a CLI: `python vmf.py --help` lists the read
+(stats/find/get/io-graph/refs), validate (lint/roundtrip), edit
+(set-kv/add-io/rm-io/replace-material/move) and generate (new-id/box/add-entity)
+commands, plus the visual loop from the sibling modules: render (vmf_render.py),
+compile / shoot / game-paths (vmf_game.py).
 """
 
 from __future__ import annotations
@@ -473,8 +475,10 @@ def make_box(mins, maxs, material: str, alloc: IdAllocator,
     solid = Node("solid", [KV("id", alloc.take())])
     for corners, out_axis, uvec, vvec in faces:
         pts = list(corners)
+        # vbsp's outward normal is (p0-p1) x (p2-p1), i.e. (p1-p0) x (p2-p0)
+        # must point INTO the brush (see plane_from_points).
         n = cross(sub(pts[1], pts[0]), sub(pts[2], pts[0]))
-        if dot(n, out_axis) < 0:
+        if dot(n, out_axis) > 0:
             pts = pts[::-1]
         side = Node("side", [])
         side.add_kv("id", alloc.take())
@@ -493,6 +497,129 @@ def make_box(mins, maxs, material: str, alloc: IdAllocator,
     ed = Node("editor", [KV("color", color), KV("visgroupshown", "1"), KV("visgroupautoshown", "1")])
     solid.items.append(ed)
     return solid
+
+
+# ---------------------------------------------------------------------------
+# Brush geometry (planes -> face polygons), shared by lint and render
+# ---------------------------------------------------------------------------
+
+def parse_plane_points(value: str):
+    """'(x y z) (x y z) (x y z)' -> three (x, y, z) float tuples. Raises ValueError."""
+    import re
+    pts = [tuple(float(v) for v in g.split()) for g in re.findall(r"\(([^)]*)\)", value)]
+    if len(pts) != 3 or any(len(p) != 3 for p in pts):
+        raise ValueError("bad plane: %r" % value)
+    return pts
+
+
+def plane_from_points(p0, p1, p2):
+    """(normal, dist) exactly as vbsp's PlaneFromPoints builds it: the normal is
+    (p0-p1) x (p2-p1) and points OUT of the brush, so the brush is the region
+    where dot(normal, x) <= dist. None for a degenerate (zero-area) plane."""
+    t1 = (p0[0] - p1[0], p0[1] - p1[1], p0[2] - p1[2])
+    t2 = (p2[0] - p1[0], p2[1] - p1[1], p2[2] - p1[2])
+    n = (t1[1] * t2[2] - t1[2] * t2[1], t1[2] * t2[0] - t1[0] * t2[2], t1[0] * t2[1] - t1[1] * t2[0])
+    ln = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]) ** 0.5
+    if ln < 1e-9:
+        return None
+    n = (n[0] / ln, n[1] / ln, n[2] / ln)
+    return n, n[0] * p0[0] + n[1] * p0[1] + n[2] * p0[2]
+
+
+def _base_winding(n, d, size=131072.0):
+    """A huge quad lying on the plane (Quake-style BaseWindingForPlane)."""
+    axis = max(range(3), key=lambda i: abs(n[i]))
+    up = (1.0, 0.0, 0.0) if axis == 2 else (0.0, 0.0, 1.0)
+    v = up[0] * n[0] + up[1] * n[1] + up[2] * n[2]
+    up = (up[0] - v * n[0], up[1] - v * n[1], up[2] - v * n[2])
+    ln = (up[0] * up[0] + up[1] * up[1] + up[2] * up[2]) ** 0.5
+    up = (up[0] / ln * size, up[1] / ln * size, up[2] / ln * size)
+    r = (up[1] * n[2] - up[2] * n[1], up[2] * n[0] - up[0] * n[2], up[0] * n[1] - up[1] * n[0])
+    o = (n[0] * d, n[1] * d, n[2] * d)
+    return [
+        (o[0] - r[0] + up[0], o[1] - r[1] + up[1], o[2] - r[2] + up[2]),
+        (o[0] + r[0] + up[0], o[1] + r[1] + up[1], o[2] + r[2] + up[2]),
+        (o[0] + r[0] - up[0], o[1] + r[1] - up[1], o[2] + r[2] - up[2]),
+        (o[0] - r[0] - up[0], o[1] - r[1] - up[1], o[2] - r[2] - up[2]),
+    ]
+
+
+def _clip_back(w, n, d, eps=0.01):
+    """Keep the part of polygon `w` behind the plane (dot(n, x) <= d)."""
+    dists = [p[0] * n[0] + p[1] * n[1] + p[2] * n[2] - d for p in w]
+    if all(x <= eps for x in dists):
+        return w
+    if all(x >= -eps for x in dists):
+        return []
+    out = []
+    m = len(w)
+    for i in range(m):
+        p, dp = w[i], dists[i]
+        q, dq = w[(i + 1) % m], dists[(i + 1) % m]
+        if dp <= eps:
+            out.append(p)
+        if (dp < -eps and dq > eps) or (dp > eps and dq < -eps):
+            t = dp / (dp - dq)
+            out.append((p[0] + t * (q[0] - p[0]), p[1] + t * (q[1] - p[1]), p[2] + t * (q[2] - p[2])))
+    return out
+
+
+def solid_windings(solid: Node):
+    """Face polygons of a brush computed from its side planes the way vbsp sees
+    them (vertices_plus is ignored). Returns [(side_node, [points])] for the
+    faces that survive clipping; a valid convex brush has >= 4 of them, an
+    inverted (normals pointing inward) or open brush has fewer."""
+    planes = []
+    for side in solid.children("side"):
+        pv = side.get("plane")
+        try:
+            pl = plane_from_points(*parse_plane_points(pv)) if pv else None
+        except ValueError:
+            pl = None
+        planes.append((side, pl))
+    out = []
+    for i, (side, pl) in enumerate(planes):
+        if pl is None:
+            continue
+        w = _base_winding(*pl)
+        for j, (_other_side, other) in enumerate(planes):
+            if j != i and other is not None:
+                w = _clip_back(w, *other)
+                if not w:
+                    break
+        if len(w) >= 3:
+            out.append((side, w))
+    return out
+
+
+def solid_vertices(solid: Node, prefer_editor_verts: bool = False):
+    """Corner points of a brush, computed from the planes (what compiles). With
+    prefer_editor_verts, Hammer++'s vertices_plus are used when every side has
+    them (faster, but they are an editor hint that can drift from the planes).
+    Returns (points, valid): valid is False when the planes don't bound a
+    volume; the points then fall back to vertices_plus if there are any."""
+    def editor_verts():
+        pts = []
+        for side in solid.children("side"):
+            vp = side.first("vertices_plus")
+            if vp is None:
+                return []
+            for v in vp.get_all("v"):
+                try:
+                    x, y, z = (float(c) for c in v.split())
+                except ValueError:
+                    return []
+                pts.append((x, y, z))
+        return pts
+
+    if prefer_editor_verts:
+        pts = editor_verts()
+        if pts:
+            return pts, True
+    faces = solid_windings(solid)
+    if len(faces) >= 4:
+        return [p for _side, w in faces for p in w], True
+    return editor_verts(), False
 
 
 def _write_or_preview(doc: Document, path: str, src_before: str, dry_run: bool, changed_desc: str) -> None:
@@ -776,40 +903,34 @@ def _cmd_lint(args):
                 problems["dangling_io"].append(f"{src} --{kv.key}--> '{tgt}' (no such targetname)")
 
     # 3) degenerate planes (zero-area: 3 collinear/coincident points)
-    def _pts(plane_val):
-        # "(x y z) (x y z) (x y z)"
-        import re
-        groups = re.findall(r"\(([^)]*)\)", plane_val)
-        out = []
-        for g in groups:
-            parts = g.split()
-            if len(parts) == 3:
-                out.append(tuple(float(p) for p in parts))
-        return out
-
-    def _degenerate(p):
-        if len(p) != 3:
-            return True
-        ax, ay, az = (p[1][i] - p[0][i] for i in range(3))
-        bx, by, bz = (p[2][i] - p[0][i] for i in range(3))
-        cx = ay * bz - az * by
-        cy = az * bx - ax * bz
-        cz = ax * by - ay * bx
-        return (cx * cx + cy * cy + cz * cz) < 1e-6
-
     for root in doc.roots:
         for n in iter_all(root):
             if n.name == "side":
                 pv = n.get("plane")
                 if pv:
                     try:
-                        if _degenerate(_pts(pv)):
+                        if plane_from_points(*parse_plane_points(pv)) is None:
                             problems["degenerate_planes"].append(f"side id={n.get('id')} plane={pv}")
                     except ValueError:
                         problems["degenerate_planes"].append(f"side id={n.get('id')} unparseable plane={pv}")
 
+    # 4) brushes whose planes don't bound a convex volume: inverted (normals
+    # pointing inward, e.g. a hand-written plane with the wrong winding) or open.
+    # vbsp drops or mangles these silently.
+    problems["invalid_brushes"] = []
+    for root in doc.roots:
+        for n in iter_all(root):
+            if n.name == "solid":
+                nsides = sum(1 for _ in n.children("side"))
+                nfaces = len(solid_windings(n))
+                if nfaces < 4:
+                    problems["invalid_brushes"].append(
+                        f"solid id={n.get('id')}: only {nfaces} of {nsides} planes bound a volume "
+                        f"(inverted winding or open brush)")
+
     # dup_ids is informational (Hammer reassigns on load); the others are real.
-    severity = {"dup_ids": "INFO", "dangling_io": "WARN", "degenerate_planes": "WARN"}
+    severity = {"dup_ids": "INFO", "dangling_io": "WARN", "degenerate_planes": "WARN",
+                "invalid_brushes": "WARN"}
     hard = 0
     for cat, items in problems.items():
         sev = severity.get(cat, "WARN")
@@ -1144,6 +1265,18 @@ def main(argv=None):
     sp = sub.add_parser("roundtrip", help="assert parse->serialize is byte-exact")
     sp.add_argument("file")
     sp.set_defaults(func=_cmd_roundtrip)
+
+    # render / compile / shoot live in sibling modules. Hand them this module
+    # instead of letting `import vmf` load a second copy of it as __main__.
+    import os
+    here = os.path.dirname(os.path.abspath(__file__))
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    sys.modules.setdefault("vmf", sys.modules[__name__])
+    import vmf_game
+    import vmf_render
+    vmf_render.add_parsers(sub)
+    vmf_game.add_parsers(sub)
 
     args = p.parse_args(argv)
     args.func(args)

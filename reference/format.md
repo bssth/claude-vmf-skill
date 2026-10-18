@@ -27,7 +27,7 @@ Everything here is verified against real Hammer++ output (several multi-MB maps)
 | `palette_plus`, `colorcorrection_plus`, `light_plus`, `postprocess_plus`, `bgimages_plus` | **Hammer++ only** — preserve verbatim, vanilla Hammer ignores them |
 | `world` | the map geometry root: worldspawn keyvalues + many `solid` blocks |
 | `entity` | one per entity (repeated); point or brush |
-| `hidden` | wraps `solid`/`entity` hidden in the editor (same inner structure) |
+| `hidden` | wraps `solid`/`entity` hidden in the editor (same inner structure); vbsp only reads `world`/`entity` and their `solid`/`connections`, so hidden objects are **not compiled** |
 | `cameras`, `cordon`/`cordons` | editor viewport cameras and cordon bounds |
 
 ## world / solid / side
@@ -63,10 +63,15 @@ world
 ```
 
 - A **solid** is a convex brush defined by the intersection of its sides' half-spaces.
-- A **side**'s `plane` is 3 points `(x y z) (x y z) (x y z)`. The plane normal is
-  `(p1-p0) × (p2-p0)` and **must point out of the solid**. vbsp uses only the plane;
-  `vertices_plus` is a Hammer++ display cache. The `box` command orients normals
-  outward automatically.
+- A **side**'s `plane` is 3 points `(x y z) (x y z) (x y z)`. vbsp builds the
+  outward normal as `(p0-p1) × (p2-p1)` (`PlaneFromPoints` in vbsp/map.cpp), which
+  means `(p1-p0) × (p2-p0)` must point **into** the solid: seen from outside the
+  brush, the three points run clockwise. Hammer's top face of a box is
+  `(x0 y1 z1) (x1 y1 z1) (x1 y0 z1)`. A brush with reversed windings bounds no
+  volume and vbsp **drops it without a warning** (often surfacing as a leak);
+  `lint` reports such brushes as `invalid_brushes` and `render` draws them red.
+  vbsp uses only the plane; `vertices_plus` is a Hammer++ display cache. The `box`
+  command orients planes correctly.
 - `uaxis`/`vaxis` map the texture: `[x y z offset] scale`. Must not be parallel to
   the face normal. Common scale is `0.25`.
 - A `dispinfo` block inside a side turns it into a **displacement** (terrain):
@@ -134,7 +139,7 @@ connections
 - Don't drop `*_plus` blocks or rewrite formatting — breaks the user's Hammer++ file.
 - Don't model repeated keys as a dict.
 - Don't hand-pick ids.
-- Don't hand-author brush planes unless you orient normals outward and keep the
-  brush convex — use `box`/the generator.
+- Don't hand-author brush planes unless you get the winding right (see above) and
+  keep the brush convex — use `box`/the generator, then `lint` (`invalid_brushes`).
 - After edits, `lint` + a git diff; the byte-exact serializer means the diff shows
   exactly (and only) your change.
