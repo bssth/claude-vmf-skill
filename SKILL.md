@@ -189,6 +189,25 @@ warned about, so typos don't pass silently):
   lamp posts with lights, doors with triggers). Axis-dependent keyvalues (e.g.
   a rotating entity's axis spawnflag) don't turn with `yaw`: pass them per
   placement through `vars`.
+- **Props and `rest`**: many models have their origin in the middle (cars
+  z -24..34, trucks -60..38, crates ±20), so a prop placed at floor height sinks
+  into it. `"rest": true` on an entity (or in `defaults` for all) moves it so
+  the bottom of its bounding box, turned by its angles, sits on the origin z
+  (a number adds a gap); bounds come from the .mdl header through the game's
+  search paths (`assets --size` shows them). Stack things by giving each the z
+  of the top below it. Entities without a `model` keyvalue (item_ammo_crate,
+  weapons) are left alone: set their z yourself.
+- **Props the engine silently deletes**: vbsp keeps a prop_static only if its
+  .mdl is flagged `$staticprop` and has no `prop_data` (unless `allowstatic`);
+  at spawn the game deletes a `prop_dynamic` whose model has `prop_data` and a
+  `prop_physics` whose model has none (only `*_override` classes skip that).
+  Most small HL2 props (crates, pallets, furniture, lockers, drums, cones,
+  tyres, monitors, the APC) carry `prop_data`, so for fixed decor they must be
+  `prop_dynamic_override`. `build` swaps the class (adding solid 6) and warns
+  once per model; `assets --missing` flags wrong classes in any map. The
+  game-side deletions only show with `developer 1`, so nothing else tells you.
+- `light_model` (room / corridor / `defaults`): a fixture model hung 8 units
+  over each automatic light, e.g. `models/props_c17/light_industrialbell01_on.mdl`.
 - `repeat` works on boxes, shapes, entities, room openings and placements. `models` picks
   one model per placement (deterministic). `scatter` places an entity at random
   but reproducible points (`seed`); `on_terrain` drops it onto a terrain shape
@@ -239,6 +258,7 @@ final planes.
 | `wall` | `points` [[x,y],...], `z`, `thickness`, `closed`, `align` center/left/right, `gaps` [[d0,d1],...] (distances along the polyline: doorways); mitered corners |
 | `fence` | a `wall` preset: thickness 4, `METAL/METALFENCE001A` both sides, nodraw top/bottom, func_detail, `posts` spacing (default 128), `post_size`, `post_material` |
 | `railing` | `points`, `z` (the floor it stands on), `height` (40), `rails` (2), `rail_size`, `posts` spacing (64), `post_size`, `closed`, `gaps`; see-through, func_detail |
+| `sandbags` | `points`, `z`, `rows` (3), `bag` [length, width, height] ([30, 16, 9]), `gap`, `closed`, `gaps`: octagonal bags in running bond along the polyline, `PLASTER/PLASTERWALL008B`, func_detail (HL2 has no sandbag model) |
 | `terrain` | `mins`/`maxs` [x,y] (whole `tile`s, default 512), `z`, `power` 2-4, `thickness`, `material` (a blend material for alpha), `flat_material`, `hills` [{`at`,`radius`,`height`,`shape` smooth/cone/gauss}], `ridges` [{`points`,`width`,`height`}], `noise` {`amp`,`scale`,`seed`,`octaves`}, `edge` {`height`,`width`} (a rim rising toward the rectangle's sides: hides the sky walls), `flat` [{`mins`,`maxs` or `polygon`, `blend`}] (height forced to 0 inside, blended outside), `clamp`, `alpha` {`from`,`to`} (paint layer 2 where the slope's normal z goes from..to), `skip_flat` (default true: flat tiles become plain brushes) |
 
 Common keys: `material`, `materials` (by face tag: `top`/`bottom`/`side`, and
@@ -265,7 +285,9 @@ into sloped faces.
 ```
 python scripts/vmf.py assets 'materials/metal/*fence*.vmt' 'models/props_foliage/*pine*.mdl' [--where] [--limit N]
 python scripts/vmf.py assets --color 'materials/wood/woodwall*.vmt'   # + each material's average colour
-python scripts/vmf.py assets --missing MAP.vmf      # materials / models / sky / vscripts / soundscapes the game can't find (exit 1 if any)
+python scripts/vmf.py assets --size 'models/props_c17/furniture*.mdl' # + each model's bounding box around its origin
+python scripts/vmf.py assets --missing MAP.vmf      # materials / models / sky / vscripts / soundscapes the game can't find,
+                                                    # and props on a class that deletes them (exit 1 if any)
 python scripts/vmf.py assets --paths                # the gameinfo.txt search paths used
 ```
 Reads the mod's `gameinfo.txt` `game` search paths, loose folders and VPK
@@ -303,7 +325,9 @@ python scripts/vmf.py game-paths [MAP.vmf]     # which tools / game dir / hl2.ex
   automatically. Geometry comes from the planes (what vbsp compiles);
   `--editor-verts` uses Hammer++'s `vertices_plus` instead (faster on huge maps).
 - **compile**: runs vbsp → vvis → vrad from the game's `bin`, prints per-tool
-  status, errors/warnings grouped by kind with counts, the fullest BSP limits, and
+  status, errors/warnings grouped by kind with counts (one group per message
+  pattern, with `all:` listing every distinct quoted name, e.g. each deleted
+  prop_static model), the fullest BSP limits, and
   on a leak: the entity, the `.lin` pointfile and the `render --leak` command to
   look at it (vvis is skipped on a leak). `fast` (default) is for iteration;
   `final` = full vis, `vrad -final`, LDR+HDR; `--vis fast` keeps vvis quick in

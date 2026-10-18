@@ -196,6 +196,76 @@ class AssetIndex:
                     return f.read() if limit is None else f.read(limit)
         return None
 
+    def model_bounds(self, model):
+        """(mins, maxs) of a model from its .mdl header (studiohdr_t): the view
+        bounding box, or the hull when that is empty. None if unreadable."""
+        key = model.lower().replace("\\", "/")
+        cache = self.__dict__.setdefault("_bounds", {})
+        if key not in cache:
+            cache[key] = self._model_bounds(key)
+        return cache[key]
+
+    def _model_bounds(self, model):
+        hdr = self.read(model, limit=156)
+        if not hdr or len(hdr) < 152 or hdr[:4] != b"IDST":
+            return None
+        hmin = struct.unpack_from("<3f", hdr, 104)
+        hmax = struct.unpack_from("<3f", hdr, 116)
+        vmin = struct.unpack_from("<3f", hdr, 128)
+        vmax = struct.unpack_from("<3f", hdr, 140)
+        if any(abs(vmax[i] - vmin[i]) > 0.01 for i in range(3)):
+            return vmin, vmax
+        return hmin, hmax
+
+    def prop_info(self, model):
+        """{'static': $staticprop flag, 'prop_data': has a prop_data block,
+        'allowstatic': prop_data says allowstatic 1} from the .mdl header and
+        its keyvalues; None if unreadable."""
+        key = model.lower().replace("\\", "/")
+        cache = self.__dict__.setdefault("_propinfo", {})
+        if key in cache:
+            return cache[key]
+        data = self.read(key)
+        info = None
+        if data and len(data) >= 320 and data[:4] == b"IDST":
+            flags = struct.unpack_from("<i", data, 152)[0]
+            kvi, kvs = struct.unpack_from("<ii", data, 312)
+            text = data[kvi:kvi + kvs].decode("latin-1", "replace") if kvi and kvs > 0 else ""
+            info = {"static": bool(flags & 0x10),
+                    "prop_data": bool(re.search(r'"?prop_data"?\s*\{', text, re.I)),
+                    "allowstatic": bool(re.search(r'"?allowstatic"?\s+"?1', text, re.I))}
+        cache[key] = info
+        return info
+
+    def prop_class_problem(self, cls, model):
+        """(reason, better class) when the engine would drop this model on this
+        prop class, else None. vbsp deletes a prop_static whose model lacks
+        $staticprop or has prop_data (without allowstatic); at spawn the game
+        deletes a prop_dynamic whose model has prop_data, and a prop_physics
+        whose model has none. The *_override classes skip the prop_data rule."""
+        info = self.prop_info(model)
+        if info is None:
+            return None
+        cls = cls.lower()
+        pd = info["prop_data"] and not info["allowstatic"]
+        if cls == "prop_static":
+            if pd:
+                return "has prop_data (a physics prop): vbsp deletes it", "prop_dynamic_override"
+            if not info["static"]:
+                return "not compiled with $staticprop: vbsp deletes it", "prop_dynamic"
+        elif cls == "prop_dynamic" and info["prop_data"]:
+            return "has prop_data: the game deletes it at spawn", "prop_dynamic_override"
+        elif cls == "prop_physics" and not info["prop_data"]:
+            return "has no prop_data: the game deletes it at spawn", "prop_physics_override"
+        return None
+
+    def static_prop_ok(self, model):
+        """(ok, reason) for a prop_static; (None, reason) when unreadable."""
+        if self.prop_info(model) is None:
+            return None, "unreadable"
+        p = self.prop_class_problem("prop_static", model)
+        return (False, p[0]) if p else (True, "")
+
     def material_color(self, material):
         """Average colour of a material's base texture as (r, g, b) 0-255, from
         the VTF header's reflectivity (linear) converted to sRGB; None if the
@@ -273,8 +343,12 @@ SKY_SUFFIXES = ("up", "dn", "lf", "rt", "ft", "bk")
 def used_assets(doc):
     """{'materials': {name: count}, 'models': {...}, 'scripts': {...},
     'soundscapes': {...}, 'sky': name or None}."""
-    mats, models, scripts, scapes = {}, {}, {}, {}
+    mats, models, scripts, scapes, statics = {}, {}, {}, {}, {}
     for e in vmf.iter_entities(doc):
+        c = (e.get("classname") or "").lower()
+        if c in ("prop_static", "prop_dynamic", "prop_physics") and (e.get("model") or "").lower().endswith(".mdl"):
+            k = (c, e.get("model").lower())
+            statics[k] = statics.get(k, 0) + 1
         for s in (e.get("vscripts") or "").split():
             s = s.lower().replace("\\", "/")
             scripts[s] = scripts.get(s, 0) + 1
@@ -295,7 +369,8 @@ def used_assets(doc):
                     models[mdl.lower()] = models.get(mdl.lower(), 0) + 1
     world = doc.top("world")
     sky = world.get("skyname") if world is not None else None
-    return {"materials": mats, "models": models, "scripts": scripts, "soundscapes": scapes, "sky": sky}
+    return {"materials": mats, "models": models, "scripts": scripts, "soundscapes": scapes, "sky": sky,
+            "static_props": statics}
 
 
 def soundscape_names(index):
@@ -324,6 +399,10 @@ def missing_assets(doc, index):
     for m, c in sorted(used["models"].items()):
         if not index.exists(m):
             out.append(("model", m, c))
+    for (cls, m), c in sorted(used["static_props"].items()):
+        p = index.prop_class_problem(cls, m)
+        if p:
+            out.append(("propclass", f"{cls} {m} {p[0]}; use {p[1]}", c))
     if used["sky"]:
         for s in SKY_SUFFIXES:
             if not index.exists(f"materials/skybox/{used['sky'].lower()}{s}.vmt"):
@@ -354,6 +433,11 @@ def index_for(args, map_path=None):
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+
+def _fmt_n(v):
+    r = round(v)
+    return str(int(r)) if abs(v - r) < 0.05 else "%.1f" % v
+
 
 def color_name(c):
     """A rough word for an sRGB colour, to scan --color output quickly."""
@@ -415,6 +499,15 @@ def _cmd_assets(args):
             if args.color and rel.endswith(".vmt") and rel.startswith("materials/"):
                 c = index.material_color(rel[len("materials/"):-4])
                 extra = "   #%02x%02x%02x %s" % (c + (color_name(c),)) if c else "   (no base texture)"
+            if args.size and rel.endswith(".mdl"):
+                b = index.model_bounds(rel)
+                if b:
+                    mn, mx = b
+                    extra += "   %s x %s x %s  (x %s..%s, y %s..%s, z %s..%s)" % tuple(
+                        _fmt_n(v) for v in (mx[0] - mn[0], mx[1] - mn[1], mx[2] - mn[2],
+                                            mn[0], mx[0], mn[1], mx[1], mn[2], mx[2]))
+                else:
+                    extra += "   (no bounds)"
             print(f"  {rel}{extra}" + (f"   [{os.path.basename(src)}]" if args.where else ""))
     for e in index.errors:
         print(f"warn {e}", file=sys.stderr)
@@ -428,6 +521,8 @@ def add_parsers(sub):
     sp.add_argument("--where", action="store_true", help="show which search path each file comes from")
     sp.add_argument("--color", action="store_true",
                     help="for materials: the base texture's average colour (from the VTF header)")
+    sp.add_argument("--size", action="store_true",
+                    help="for models: bounding box size and extents around the model origin (from the .mdl header)")
     sp.add_argument("--paths", action="store_true", help="print the search paths used")
     sp.add_argument("--game-dir", help="mod/game folder with gameinfo.txt (env VMF_GAME_DIR)")
     sp.add_argument("--game-exe", help="game executable, e.g. hl2.exe (env VMF_GAME_EXE)")

@@ -52,6 +52,8 @@ DEFAULTS = {
     "corridor_light": 120,        # brightness of automatic corridor lights; 0 = none
     "light_color": [255, 240, 220],
     "light_spacing": 320,         # one automatic light per cell of this size
+    "rest": False,                # entities with a model: sit the model's bottom on the origin z
+    "light_model": None,          # fixture model hung above each automatic light (e.g. a lamp)
 }
 
 OPENING_TYPES = {
@@ -584,18 +586,24 @@ def _thick(spec, d, key):
     return num(v)
 
 
-def auto_lights(geo, box, brightness, color, spacing, z):
-    """One light per spacing x spacing cell of `box`'s footprint, at height z."""
+def auto_lights(geo, box, brightness, color, spacing, z, model=None, assets=None):
+    """One light per spacing x spacing cell of `box`'s footprint, at height z.
+    With `model`, a prop_static fixture hangs just above each light (its
+    bottom 8 units over it, so it doesn't shadow the light)."""
     if not brightness:
         return 0
     nx = max(1, int(math.ceil((box[3] - box[0]) / spacing - 0.25)))
     ny = max(1, int(math.ceil((box[4] - box[1]) / spacing - 0.25)))
+    mz = model_min_z(assets, model, (0, 0, 0)) if model else None
     for i in range(nx):
         for j in range(ny):
             x = box[0] + (box[3] - box[0]) * (i + 0.5) / nx
             y = box[1] + (box[4] - box[1]) * (j + 0.5) / ny
             add_entity(geo.doc, geo.alloc, "light", light_kvs(brightness, color), (num(x), num(y), num(z)),
                        color="220 220 40", visgroup=geo.visgroup)
+            if model:
+                add_entity(geo.doc, geo.alloc, "prop_static", [("model", model), ("angles", "0 0 0")],
+                           (num(x), num(y), num(z + 8 - (mz or 0))), visgroup=geo.visgroup)
     return nx * ny
 
 
@@ -604,7 +612,8 @@ def auto_lights(geo, box, brightness, color, spacing, z):
 # ---------------------------------------------------------------------------
 
 ROOM_KEYS = {"name", "mins", "maxs", "size", "wall", "floor", "ceiling", "material", "wall_material",
-             "floor_material", "ceiling_material", "openings", "light", "light_color", "nodes", "roof"}
+             "floor_material", "ceiling_material", "openings", "light", "light_color", "nodes", "roof",
+             "light_model"}
 OPENING_KEYS = {"wall", "type", "offset", "at", "width", "height", "sill", "repeat"}
 
 
@@ -744,8 +753,8 @@ def add_room_openings(geo, spec, d, info, where="room", warn=print):
     return out
 
 
-def room_extras(geo, spec, d, info):
-    """Automatic lights and AI nodes for a room (build only)."""
+def room_extras(geo, spec, d, info, assets=None):
+    """Automatic lights (with an optional fixture model) and AI nodes for a room (build only)."""
     x0, y0, z0, x1, y1, z1 = info["interior"]
     bright = spec.get("light", d["light"])
     if bright is True:
@@ -756,7 +765,7 @@ def room_extras(geo, spec, d, info):
         # a third of the way down from the ceiling: lower and the ceiling gets a
         # hot spot, higher and the floor goes dark
         n_lights = auto_lights(geo, info["interior"], float(bright), color, float(d["light_spacing"]),
-                               z1 - max(24, (z1 - z0) / 3))
+                               z1 - max(24, (z1 - z0) / 3), spec.get("light_model", d.get("light_model")), assets)
     nodes = 0
     spacing = spec.get("nodes")
     if spacing:
@@ -785,7 +794,7 @@ def room_extras(geo, spec, d, info):
 
 CORRIDOR_KEYS = {"name", "from", "to", "points", "width", "height", "wall", "floor", "ceiling", "material",
                  "wall_material", "floor_material", "ceiling_material", "from_end", "to_end", "at", "z",
-                 "light", "light_color"}
+                 "light", "light_color", "light_model"}
 
 
 def corridor_between(ra, rb, width, at=None, z=None, where="corridor"):
@@ -960,7 +969,7 @@ def add_corridor(geo, spec, d, rooms=None, interiors=None, where="corridor", war
     return {"segments": segs, "ends": ends, "points": pts, "width": width, "height": height}
 
 
-def corridor_extras(geo, spec, d, info):
+def corridor_extras(geo, spec, d, info, assets=None):
     bright = spec.get("light", d["corridor_light"])
     if bright is True:
         bright = d["corridor_light"] or DEFAULTS["corridor_light"]
@@ -970,7 +979,8 @@ def corridor_extras(geo, spec, d, info):
     n = 0
     for s in info["segments"]:
         b = s["interior"]
-        n += auto_lights(geo, b, float(bright), color, float(d["light_spacing"]), b[5] - max(24, (b[5] - b[2]) / 3))
+        n += auto_lights(geo, b, float(bright), color, float(d["light_spacing"]), b[5] - max(24, (b[5] - b[2]) / 3),
+                         spec.get("light_model", d.get("light_model")), assets)
     return n
 
 
@@ -1141,7 +1151,7 @@ def expand_prefabs(spec, warn):
 BOX_KEYS = {"name", "mins", "maxs", "size", "material", "entity", "repeat", "kv", "outputs"}
 CARVE_KEYS = {"name", "mins", "maxs", "size"}
 ENTITY_KEYS = {"class", "name", "origin", "room", "angles", "yaw", "pitch", "look_at", "kv", "brightness", "color",
-               "model", "models", "repeat", "scatter", "on_terrain", "outputs"}
+               "model", "models", "repeat", "scatter", "on_terrain", "outputs", "rest"}
 SCATTER_KEYS = {"count", "mins", "maxs", "polygon", "avoid", "min_dist", "seed"}
 
 
@@ -1222,7 +1232,26 @@ def _angles(spec, pos, where):
     return None
 
 
-def build(doc, spec, warn=print):
+def model_min_z(assets, model, angles):
+    """Lowest z of a model's bounding box (relative to its origin) once turned
+    by Source angles [pitch, yaw, roll]; None without bounds."""
+    if assets is None:
+        return None
+    b = assets.model_bounds(model)
+    if b is None:
+        return None
+    import vmf_shapes
+    mn, mx = b
+    m = vmf_shapes._rotation({"pitch": angles[0], "yaw": angles[1], "roll": angles[2]})
+    zs = []
+    for x in (mn[0], mx[0]):
+        for y in (mn[1], mx[1]):
+            for z in (mn[2], mx[2]):
+                zs.append(m[2][0] * x + m[2][1] * y + m[2][2] * z if m else z)
+    return min(zs)
+
+
+def build(doc, spec, warn=print, assets=None):
     """Generate the layout into `doc` (in memory). Returns a report dict."""
     report = {"rooms": [], "corridors": [], "stairs": [], "warnings": [], "lights": 0, "nodes": 0,
               "views": 0, "entities": 0, "boxes": 0, "carves": 0}
@@ -1333,11 +1362,14 @@ def build(doc, spec, warn=print):
 
     # lights and nodes after all geometry, so they're never carved around
     for name, r, info, where in room_infos:
-        nl, nn = room_extras(geo, r, d, info)
+        nl, nn = room_extras(geo, r, d, info, assets)
         report["lights"] += nl
         report["nodes"] += nn
     for name, c, info in corr_infos:
-        report["lights"] += corridor_extras(geo, c, d, info)
+        report["lights"] += corridor_extras(geo, c, d, info, assets)
+
+    rest_missing = set()
+    static_swapped = set()
 
     def terrain_z(x, y):
         for (tx0, ty0, tx1, ty1), hfn in terrains:
@@ -1395,7 +1427,32 @@ def build(doc, spec, warn=print):
                 kvs.append(("model", e["model"]))
             for k, v in (e.get("kv") or {}).items():
                 kvs = [kv for kv in kvs if kv[0] != k] + [(k, v)]
-            ent = add_entity(doc, alloc, cls, kvs, tuple(num(v) for v in org),
+            rest = e.get("rest", d.get("rest", False))
+            mdl = dict(kvs).get("model")
+            if rest not in (False, None) and mdl:
+                try:
+                    a = [float(c) for c in str(dict(kvs).get("angles", "0 0 0")).split()]
+                except ValueError:
+                    a = [0.0, 0.0, 0.0]
+                mz = model_min_z(assets, mdl, a)
+                if mz is None:
+                    if mdl not in rest_missing:
+                        rest_missing.add(mdl)
+                        w(f"{where}: can't read the bounds of {mdl} (no game dir / model missing): 'rest' ignored")
+                else:
+                    org = [org[0], org[1], org[2] - mz + (0.0 if rest is True else float(rest))]
+            ecls = cls
+            if cls in ("prop_static", "prop_dynamic", "prop_physics") and mdl and assets is not None:
+                prob = assets.prop_class_problem(cls, mdl)
+                if prob:
+                    # vbsp or the game would delete it: use the class that keeps it
+                    ecls = prob[1]
+                    if ecls.startswith("prop_dynamic") and not any(k == "solid" for k, _v in kvs):
+                        kvs.append(("solid", "6"))
+                    if (cls, mdl) not in static_swapped:
+                        static_swapped.add((cls, mdl))
+                        w(f"{where}: {cls} {mdl} {prob[0]}; placed as {ecls}")
+            ent = add_entity(doc, alloc, ecls, kvs, tuple(num(v) for v in org),
                              color="0 255 0" if cls == "info_player_start" else "220 30 220", visgroup=visgroup)
             report["io"] = report.get("io", 0) + add_outputs(ent, e.get("outputs"), where)
             report["lights" if cls == "light" else "entities"] += 1
@@ -1609,7 +1666,13 @@ def _cmd_build(args):
         else:
             doc = new_document((spec.get("world") or {}).get("skyname", "sky_day01_01"))
             src = None
-        report = build(doc, spec)
+        assets = None
+        try:
+            import vmf_assets
+            assets = vmf_assets.index_for(args, args.file)
+        except Exception:                       # no game dir: bounds-based features just warn
+            assets = None
+        report = build(doc, spec, assets=assets)
     except BuildError as e:
         print(f"layout error: {e}", file=sys.stderr)
         sys.exit(2)

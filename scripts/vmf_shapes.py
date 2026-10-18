@@ -63,6 +63,7 @@ SHAPE_KEYS = {
               "post_material"},
     "railing": {"points", "z", "height", "closed", "gaps", "posts", "post_size", "post_material", "rails",
                 "rail_size"},
+    "sandbags": {"points", "z", "rows", "bag", "gap", "closed", "gaps"},
     "terrain": {"mins", "maxs", "z", "tile", "power", "hills", "ridges", "noise", "edge", "flat", "clamp",
                 "thickness", "alpha", "skip_flat", "flat_material", "side_material"},
 }
@@ -935,6 +936,47 @@ def shape_wall(spec, where, fence=False):
     return pieces, posts, total
 
 
+def shape_sandbags(spec, where):
+    """Rows of sandbags along a polyline: each bag an octagonal bar lying along
+    the wall, every other row shifted half a bag (running bond)."""
+    pts = _polyline(spec, where)
+    z0 = _num(spec, "z", 0, where)
+    rows = max(1, int(spec.get("rows", 3)))
+    bag = spec.get("bag", [30, 16, 9])
+    L, W, H = (float(v) for v in bag)
+    gap = float(spec.get("gap", 1.5))
+    closed = bool(spec.get("closed", False))
+    runs, total, loop = polyline_spans(pts, closed, spec.get("gaps"), where)
+    c = min(W, H) * 0.32
+    section = [(-W / 2 + c, 0.0), (W / 2 - c, 0.0), (W / 2, c), (W / 2, H - c), (W / 2 - c, H),
+               (-W / 2 + c, H), (-W / 2, H - c), (-W / 2, c)]
+    pieces = []
+    for run in runs:
+        segs = [(run[i], run[i + 1]) for i in range(len(run) - 1)] + ([(run[-1], run[0])] if loop else [])
+        for a, b in segs:
+            dx, dy = b[0] - a[0], b[1] - a[1]
+            seg = math.hypot(dx, dy)
+            if seg < L * 0.5:
+                continue
+            d = (dx / seg, dy / seg, 0.0)
+            u = (-d[1], d[0], 0.0)
+            n = max(1, int(seg // L))
+            pad = (seg - n * L) / 2
+            for k in range(rows):
+                shift = L / 2 if (k % 2 and n > 1) else 0.0
+                count = n - 1 if shift else n
+                zb = z0 + k * (H - 1.0)
+                for m in range(count):
+                    s0 = pad + shift + m * L + gap / 2
+                    s1 = s0 + L - gap
+                    origin = (a[0], a[1], zb)
+                    pc = prism(section, frame_mapper(origin, u, (0.0, 0.0, 1.0), d), s0, s1,
+                               cap_tags=("end", "end"))
+                    if pc:
+                        pieces.append(pc)
+    return pieces, total
+
+
 def shape_railing(spec, where):
     """Posts plus horizontal rails along a polyline standing on z."""
     pts = _polyline(spec, where)
@@ -1313,6 +1355,10 @@ def make_pieces(spec, where="shape", default_gable_mat=None):
         rp, gables = shape_roof(spec, where, default_gable_mat)
         pieces = [(p, "main" if role == "roof" else "gable") for p, role in rp]
         extra["gable_material"] = gables["material"] if gables else None
+    elif t == "sandbags":
+        sp_, total = shape_sandbags(spec, where)
+        pieces = [(p, "main") for p in sp_]
+        extra["length"] = total
     elif t in ("wall", "fence", "railing"):
         if t == "railing":
             wp, posts, total = shape_railing(spec, where)
@@ -1331,6 +1377,7 @@ def make_pieces(spec, where="shape", default_gable_mat=None):
 FENCE_DEFAULTS = {"material": "METAL/METALFENCE001A", "post_material": "METAL/METALWALL012B",
                   "entity": "func_detail"}
 RAILING_DEFAULTS = {"material": "METAL/METALWALL012B", "entity": "func_detail"}
+SANDBAG_DEFAULTS = {"material": "PLASTER/PLASTERWALL008B", "entity": "func_detail", "tex_scale": 0.125}
 
 
 def add_shape(geo, spec, d, where="shape", warn=print, terrains=None):
@@ -1349,7 +1396,8 @@ def add_shape(geo, spec, d, where="shape", warn=print, terrains=None):
                               max(mins[1], maxs[1])), hfn))
         return {"type": t, "brushes": len(solids), **info}
     fence = t == "fence"
-    base = dict(FENCE_DEFAULTS) if fence else dict(RAILING_DEFAULTS) if t == "railing" else {}
+    base = (dict(FENCE_DEFAULTS) if fence else dict(RAILING_DEFAULTS) if t == "railing"
+            else dict(SANDBAG_DEFAULTS) if t == "sandbags" else {})
     base.update({k: v for k, v in spec.items()})
     spec = base
     pieces, extra = make_pieces(spec, where, default_gable_mat=d.get("wall_material"))

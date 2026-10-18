@@ -258,7 +258,8 @@ _ELAPSED = re.compile(r"(?:(\d+) minutes?, )?(\d+) seconds? elapsed")
 
 def summarize_output(text):
     """Group the interesting lines of a tool's output: severity, normalized
-    pattern (numbers -> #), count, first example."""
+    pattern (numbers -> #, quoted names -> "..."), count, first example and the
+    distinct quoted names (e.g. every model a prop_static error was about)."""
     groups = {}
     for raw in text.replace("\r", "\n").split("\n"):
         line = re.sub(r"^(\d\.\.\.)+\d*", "", raw).strip()  # progress dots glued to text
@@ -267,9 +268,14 @@ def summarize_output(text):
         sev = "ERROR" if _ERR.search(line) else "WARN" if _WARN.search(line) else None
         if not sev:
             continue
-        key = re.sub(r"-?\d+(\.\d+)?", "#", line)
-        g = groups.setdefault(key, {"sev": sev, "count": 0, "example": line})
+        names = re.findall(r'"([^"]*)"', line)
+        key = re.sub(r'"[^"]*"', '"..."', line)
+        key = re.sub(r"-?\d+(\.\d+)?", "#", key)
+        g = groups.setdefault(key, {"sev": sev, "count": 0, "example": line, "names": []})
         g["count"] += 1
+        for n in names:
+            if n not in g["names"]:
+                g["names"].append(n)
     return sorted(groups.values(), key=lambda g: (g["sev"] != "ERROR", -g["count"]))
 
 
@@ -368,6 +374,10 @@ def _cmd_compile(args):
         for g in summarize_output(out)[: args.limit]:
             cnt = f" (x{g['count']})" if g["count"] > 1 else ""
             print(f"      {g['sev']:5} {g['example'][:160]}{cnt}")
+            if len(g["names"]) > 1:
+                shown = ", ".join(g["names"][:12])
+                more = f" (+{len(g['names']) - 12} more)" if len(g["names"]) > 12 else ""
+                print(f"            all: {shown}{more}")
         limits = parse_limits(out) or limits
     if limits:
         top = sorted(limits, key=lambda t: -t[3])

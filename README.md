@@ -165,7 +165,12 @@ compiled BSPs); `"on_terrain": true` drops scattered props onto it.
 Entities, entity boxes and entity shapes take `outputs`
 (`[output, target, input, param, delay, times]`), brush entities take an
 `origin` (the hinge of doors and rotating buttons), and `trigger_*` brushes get
-the trigger material by themselves. Repeated gameplay pieces are **prefabs**:
+the trigger material by themselves. `"rest": true` stands a prop on its origin
+z using the model's bounding box from the .mdl header (most HL2 props have the
+origin in their middle, so they'd sink into the floor otherwise). Props whose
+model the engine would silently drop on the given class (a physics model on a
+prop_static or prop_dynamic, a non-`$staticprop` model on a prop_static) are
+moved to the class that keeps them, usually `prop_dynamic_override`. Repeated gameplay pieces are **prefabs**:
 a group of boxes / shapes / entities defined once in local coordinates and
 stamped with `place` entries (position, yaw, repeat), with `{name}`, `{i}` and
 custom `vars` filled into targetnames and I/O so every copy is wired to itself.
@@ -188,6 +193,7 @@ game_text messages on screen.
 ```bash
 python scripts/vmf.py assets 'materials/metal/*fence*.vmt' 'models/props_foliage/*pine*.mdl'
 python scripts/vmf.py assets --color 'materials/dev/*.vmt'     # average colour per material
+python scripts/vmf.py assets --size 'models/props_junk/*.mdl'   # model bounding boxes (for placement)
 python scripts/vmf.py assets --missing maps/mymap.vmf           # materials, models, sky, vscripts, soundscapes the game can't find
 ```
 
