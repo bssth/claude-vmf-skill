@@ -135,6 +135,7 @@ python scripts/vmf.py game-paths [MAP.vmf]     # which tools / game dir / hl2.ex
 
 - Hammer++ writes **LF** line endings, even when the surrounding repo is CRLF. The tool detects & preserves line endings per file — don't normalize them.
 - Keep any script output you add **ASCII**: Windows consoles with a legacy code page (e.g. cp1251, cp1252) crash on non-ASCII prints.
+- Old Valve-source VMFs can be cp1252, not UTF-8: the tool decodes UTF-8 first, else latin-1, and writes the file back in the same encoding (byte-exact). Non-ASCII map text prints as `\xNN` escapes; an edit that latin-1 can't hold (e.g. `set-kv` with a non-Latin letter) aborts without writing.
 - `id`s are shared across solids/sides/entities and must be unique; always allocate with `new-id` / the tool's allocator, never hand-pick.
 - Keys repeat (`vertices_plus` `"v"`, multiple same-named I/O outputs). Never model VMF as a plain dict.
 - Hammer++ `*_plus` blocks must be preserved — the tool does this automatically.

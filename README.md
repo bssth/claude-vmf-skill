@@ -38,8 +38,8 @@ scripts/test_roundtrip.py   byte-exact parse->serialize check over a tree of map
 Key properties:
 
 - **Byte-exact round-trip.** Parsing and re-serializing an unchanged map reproduces
-  it byte for byte (line endings included), so a diff after an edit shows only the
-  edit.
+  it byte for byte (line endings and text encoding included: UTF-8, or latin-1 for
+  old cp1252 sources), so a diff after an edit shows only the edit.
 - **Repeated keys and interleaving preserved.** VMF is not a dict: `vertices_plus`
   has many `"v"`, `connections` repeats output names, and keyvalues interleave
   with child blocks. The model is an ordered list.

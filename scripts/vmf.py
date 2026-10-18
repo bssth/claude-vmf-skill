@@ -23,7 +23,8 @@ Design constraints that this module is built around (see SKILL.md):
     perfectly regular layout (one tab per nesting level, name and brace on
     their own lines, trailing newline), and the serializer reproduces it.
   * Line endings are detected per file (Hammer++ writes LF even in CRLF repos)
-    and restored on write.
+    and restored on write. So is the text encoding: UTF-8, else latin-1 (old
+    Valve sources are cp1252), restored on write.
 
 The module is both a library (parse/load/serialize/save + the Node/KV model +
 brush geometry) and a CLI: `python vmf.py --help` lists the read
@@ -126,14 +127,16 @@ class Node:
 
 class Document:
     """A whole VMF file: an ordered list of top-level Nodes plus the newline
-    style used for byte-exact serialization."""
+    style and text encoding used for byte-exact serialization."""
 
-    __slots__ = ("roots", "newline", "trailing_newline")
+    __slots__ = ("roots", "newline", "trailing_newline", "encoding")
 
-    def __init__(self, roots: List[Node], newline: str = "\n", trailing_newline: bool = True):
+    def __init__(self, roots: List[Node], newline: str = "\n", trailing_newline: bool = True,
+                 encoding: str = "utf-8"):
         self.roots = roots
         self.newline = newline
         self.trailing_newline = trailing_newline
+        self.encoding = encoding
 
     def top(self, name: str) -> Optional[Node]:
         for n in self.roots:
@@ -308,9 +311,36 @@ def parse(text: str) -> Document:
     return Document(roots, newline=newline, trailing_newline=trailing)
 
 
+FALLBACK_ENCODING = "latin-1"
+
+
+def decode(data: bytes) -> Tuple[str, str]:
+    """bytes -> (text, encoding). UTF-8 when the bytes are valid UTF-8, else
+    latin-1, which maps every byte to one character so the text encodes back to
+    exactly the same bytes (old Valve sources carry cp1252 bytes such as 0x92)."""
+    try:
+        return data.decode("utf-8"), "utf-8"
+    except UnicodeDecodeError:
+        return data.decode(FALLBACK_ENCODING), FALLBACK_ENCODING
+
+
+def parse_bytes(data: bytes) -> Document:
+    """Parse raw file bytes; the Document remembers the encoding they used."""
+    text, encoding = decode(data)
+    doc = parse(text)
+    doc.encoding = encoding
+    return doc
+
+
+def read_text(path: str) -> Tuple[str, str]:
+    """(text, encoding) of a map file. Read as bytes so newlines stay untouched."""
+    with open(path, "rb") as f:
+        return decode(f.read())
+
+
 def load(path: str) -> Document:
-    with open(path, "r", encoding="utf-8", newline="") as f:
-        return parse(f.read())
+    with open(path, "rb") as f:
+        return parse_bytes(f.read())
 
 
 def _serialize_node(node: Node, indent: int, out: List[str]) -> None:
@@ -339,10 +369,28 @@ def serialize(doc: Document) -> str:
     return text
 
 
+def serialize_bytes(doc: Document) -> bytes:
+    """serialize() encoded with the encoding the file was loaded with. Raises
+    UnicodeEncodeError if an edit put characters into a latin-1 map that it
+    cannot hold."""
+    return serialize(doc).encode(doc.encoding)
+
+
 def save(doc: Document, path: str) -> None:
-    text = serialize(doc)
-    with open(path, "w", encoding="utf-8", newline="") as f:
-        f.write(text)
+    data = serialize_bytes(doc)
+    with open(path, "wb") as f:
+        f.write(data)
+
+
+def safe_stdio() -> None:
+    """Make print() unable to crash on map text: a legacy Windows code page
+    (cp1251, cp1252...) can't encode every character a map name may contain, so
+    unencodable ones come out as \\xNN / \\uNNNN escapes instead."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="backslashreplace")
+        except (AttributeError, ValueError):
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -633,6 +681,13 @@ def _write_or_preview(doc: Document, path: str, src_before: str, dry_run: bool, 
     except VMFParseError as e:
         print(f"ABORT: produced invalid VMF ({e}); nothing written", file=sys.stderr)
         sys.exit(3)
+    # guard: the file keeps the encoding it came with, so the edit must fit in it
+    try:
+        data = out.encode(doc.encoding)
+    except UnicodeEncodeError as e:
+        print(f"ABORT: {path} is {doc.encoding}; the edit has characters it cannot hold ({e}); "
+              f"nothing written", file=sys.stderr)
+        sys.exit(3)
     if out == src_before:
         print("no change")
         return
@@ -650,8 +705,8 @@ def _write_or_preview(doc: Document, path: str, src_before: str, dry_run: bool, 
                 break
         print(f"\n[dry-run] {changed_desc}; not written")
         return
-    with open(path, "w", encoding="utf-8", newline="") as f:
-        f.write(out)
+    with open(path, "wb") as f:
+        f.write(data)
     print(f"{changed_desc}; written to {path}")
 
 
@@ -948,13 +1003,15 @@ def _cmd_lint(args):
 
 
 def _cmd_roundtrip(args):
-    with open(args.file, "r", encoding="utf-8", newline="") as f:
+    with open(args.file, "rb") as f:
         src = f.read()
-    out = serialize(parse(src))
+    doc = parse_bytes(src)
+    out = serialize_bytes(doc)
+    note = "" if doc.encoding == "utf-8" else f", {doc.encoding}"
     if out == src:
-        print(f"OK  {args.file}  ({len(src)} bytes)")
+        print(f"OK  {args.file}  ({len(src)} bytes{note})")
     else:
-        print(f"DIFF {args.file}: lens {len(src)} -> {len(out)}")
+        print(f"DIFF {args.file}: lens {len(src)} -> {len(out)}{note}")
         sys.exit(1)
 
 
@@ -1157,6 +1214,7 @@ def _add_selector_args(sp):
 
 def main(argv=None):
     import argparse
+    safe_stdio()
     p = argparse.ArgumentParser(prog="vmf.py", description="VMF (Hammer++) inspector/editor")
     sub = p.add_subparsers(dest="cmd", required=True)
 
