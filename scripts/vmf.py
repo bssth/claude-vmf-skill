@@ -641,6 +641,59 @@ def solid_windings(solid: Node):
     return out
 
 
+def disp_grid(side: Node, winding):
+    """World positions of a displacement's vertices as rows of (x, y, z), the
+    way vbsp builds them: the face winding (vbsp's order) is rotated to start at
+    the corner nearest `startposition`; row i runs from corner 0 toward corner
+    1, column j from the 0-1 edge toward the 3-2 edge; each vertex is moved by
+    normal * distance + offset (+ elevation along the face normal). None if the
+    side has no usable dispinfo or the face isn't a quad."""
+    di = side.first("dispinfo")
+    if di is None or len(winding) != 4:
+        return None
+    try:
+        power = int(di.get("power") or "0")
+        start = [float(c) for c in (di.get("startposition") or "").strip("[] ").split()]
+        elev = float(di.get("elevation") or "0")
+    except ValueError:
+        return None
+    n = (1 << power) + 1
+    if len(start) != 3 or n < 3:
+        return None
+
+    def rows(name, width):
+        blk = di.first(name)
+        out = []
+        for r in range(n):
+            vals = (blk.get("row%d" % r) if blk is not None else None) or ""
+            try:
+                nums = [float(v) for v in vals.split()]
+            except ValueError:
+                nums = []
+            if len(nums) < n * width:
+                nums = nums + [0.0] * (n * width - len(nums))
+            out.append(nums)
+        return out
+    normals, dists, offsets = rows("normals", 3), rows("distances", 1), rows("offsets", 3)
+    si = min(range(4), key=lambda i: sum((winding[i][k] - start[k]) ** 2 for k in range(3)))
+    p = [winding[(si + k) % 4] for k in range(4)]
+    fn = plane_from_points(*parse_plane_points(side.get("plane") or ""))
+    fnorm = fn[0] if fn else (0.0, 0.0, 1.0)
+    grid = []
+    for i in range(n):
+        t = i / (n - 1)
+        e0 = [p[0][k] + (p[1][k] - p[0][k]) * t for k in range(3)]
+        e1 = [p[3][k] + (p[2][k] - p[3][k]) * t for k in range(3)]
+        row = []
+        for j in range(n):
+            s = j / (n - 1)
+            d = dists[i][j]
+            row.append(tuple(e0[k] + (e1[k] - e0[k]) * s + normals[i][3 * j + k] * d + offsets[i][3 * j + k]
+                             + fnorm[k] * elev for k in range(3)))
+        grid.append(row)
+    return grid
+
+
 def solid_vertices(solid: Node, prefer_editor_verts: bool = False):
     """Corner points of a brush, computed from the planes (what compiles). With
     prefer_editor_verts, Hammer++'s vertices_plus are used when every side has
@@ -1332,12 +1385,16 @@ def main(argv=None):
     if here not in sys.path:
         sys.path.insert(0, here)
     sys.modules.setdefault("vmf", sys.modules[__name__])
+    import vmf_assets
     import vmf_build
     import vmf_game
     import vmf_render
+    import vmf_shapes
     vmf_build.add_parsers(sub)
+    vmf_shapes.add_parsers(sub)
     vmf_render.add_parsers(sub)
     vmf_game.add_parsers(sub)
+    vmf_assets.add_parsers(sub)
 
     args = p.parse_args(argv)
     args.func(args)

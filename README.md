@@ -12,7 +12,11 @@ what was asked for.
 
 It can **build playable greybox blockouts**: rooms with doors and windows,
 corridors, stairs and holes cut through existing walls, or a whole multi-floor
-layout from one short JSON file.
+layout from one short JSON file. Beyond boxes it makes **shapes**: rotated
+boxes, ramps, cylinders and pipes, cones, rings and tunnels, arched walls,
+gable / shed / barrel roofs, polyline walls, fences and railings, and
+**displacement terrain** with hills, ridges, noise and a rim that hides the sky
+walls; trees and props can be scattered over it.
 
 It also lets the agent **look at what it built**: draw the map to a PNG, compile
 it and get leaks and errors explained, and screenshot the compiled map in the
@@ -25,6 +29,8 @@ SKILL.md              skill entry point: triggers, cheat-sheet, decision tree, g
 reference/format.md   VMF format reference (loaded on demand)
 scripts/vmf.py        parser / model / serializer / brush geometry + CLI (pure stdlib, Python 3.8+)
 scripts/vmf_build.py  `build`, `room`, `corridor`, `stairs`, `carve`, `new-map`: blockouts
+scripts/vmf_shapes.py `shape`: non-box brushes (convex pieces) and displacement terrain
+scripts/vmf_assets.py `assets`: materials / models in the game's search paths and VPKs
 scripts/vmf_render.py `render`: plan / side view PNG (stdlib PNG encoder, bitmap font)
 scripts/vmf_game.py   `compile`, `shoot`, `game-paths`: vbsp/vvis/vrad and the game
 scripts/test_roundtrip.py   byte-exact parse->serialize check over a tree of maps
@@ -38,7 +44,8 @@ scripts/test_roundtrip.py   byte-exact parse->serialize check over a tree of map
 | Validate | `lint`, `roundtrip` |
 | Edit (all support `--dry-run`) | `set-kv`, `add-io`, `rm-io`, `replace-material`, `move` |
 | Generate | `new-id`, `box`, `add-entity` |
-| Blockout | `build`, `new-map`, `room`, `corridor`, `stairs`, `carve` |
+| Blockout | `build`, `new-map`, `room`, `corridor`, `stairs`, `carve`, `shape` |
+| Assets | `assets` (find files, `--color`, `--missing MAP`) |
 | See | `render`, `compile`, `shoot`, `game-paths` |
 
 Key properties:
@@ -120,8 +127,9 @@ built around it, openings are cut by splitting the wall into the boxes around
 the hole, corridors open into the walls they reach and are capped elsewhere,
 stairs get a player-clip ramp, and rooms and corridors get ceiling lights.
 `build` warns about every opening that leads to the void (a leak) and about
-unknown keys. Every brush is an axis-aligned box from the same generator as
-`box` and is checked like `lint invalid_brushes` before anything is written.
+unknown keys. Room, corridor and stair brushes are axis-aligned boxes from the
+same generator as `box`; every brush is checked like `lint invalid_brushes`
+before anything is written.
 The same pieces work one at a time on an existing map:
 
 ```bash
@@ -132,7 +140,60 @@ python scripts/vmf.py carve    maps/mymap.vmf --mins 96 96 -16 --maxs 192 192 0 
 ```
 
 The full layout format (openings, bent corridors, room-relative entities,
-camera views for `shoot`, defaults and materials) is in [SKILL.md](SKILL.md).
+camera views for `shoot`, defaults and materials, `repeat`, `scatter`) is in
+[SKILL.md](SKILL.md).
+
+## Shapes and terrain
+
+Anything that isn't an axis-aligned box goes in the layout's `"shapes"` list
+or through `shape` on an existing map:
+
+```bash
+python scripts/vmf.py shape maps/mymap.vmf   '{"type": "arch", "from": [0, 0], "to": [512, 0], "z": [0, 256], "openings": [{"at": 128, "width": 96, "height": 160}]}'   '{"type": "ring", "from": [0, 300, 0], "to": [0, 556, 0], "radius": 48, "thickness": 8, "arc": [0, 180]}'   '{"type": "roof", "style": "gable", "mins": [0, 600], "maxs": [512, 900], "z": 160, "axis": "x", "rise": 96}'
+```
+
+Each shape is cut into convex brushes whose shared faces get exactly the same
+planes (chosen from the face's vertex set, independent of order), so pieces
+meet without cracks; `vertices_plus` is computed from the final planes. Rooms
+take a `"roof"` directly. `terrain` builds displacement tiles whose heights come
+from world coordinates (hills, ridges, value noise, a raised rim, flattened
+zones), with the vertex grid laid out the way vbsp reads it (verified against
+compiled BSPs); `"on_terrain": true` drops scattered props onto it.
+
+## Logic: I/O, triggers, prefabs
+
+Entities, entity boxes and entity shapes take `outputs`
+(`[output, target, input, param, delay, times]`), brush entities take an
+`origin` (the hinge of doors and rotating buttons), and `trigger_*` brushes get
+the trigger material by themselves. Repeated gameplay pieces are **prefabs**:
+a group of boxes / shapes / entities defined once in local coordinates and
+stamped with `place` entries (position, yaw, repeat), with `{name}`, `{i}` and
+custom `vars` filled into targetnames and I/O so every copy is wired to itself.
+
+```json
+"prefabs": {"popup": {
+  "shapes": [{"type": "box", "mins": [-20, -2, 2], "maxs": [20, 2, 66], "entity": "func_rot_button",
+              "name": "{name}", "origin": [0, 0, 2],
+              "kv": {"spawnflags": "578", "distance": "90", "speed": "360", "wait": "3", "health": "1"},
+              "outputs": [["OnPressed", "script", "RunScriptCode", "Hit({i})"]]}]}},
+"place": [{"prefab": "popup", "name": "t{i}", "origin": [0, 512, 0], "repeat": {"count": 9, "step": [112, 0, 0]}}]
+```
+
+`shoot` can test logic: `--view "name x y z pitch yaw | ent_fire t1 press"`
+runs console commands before that view's screenshot, and `--hud` keeps
+game_text messages on screen.
+
+## Assets
+
+```bash
+python scripts/vmf.py assets 'materials/metal/*fence*.vmt' 'models/props_foliage/*pine*.mdl'
+python scripts/vmf.py assets --color 'materials/dev/*.vmt'     # average colour per material
+python scripts/vmf.py assets --missing maps/mymap.vmf           # materials, models, sky, vscripts, soundscapes the game can't find
+```
+
+Reads the `game` search paths of the mod's `gameinfo.txt` and the VPK
+directories directly, so you can pick materials and models that exist (and see
+their colours) before a compile turns typos into purple checkerboards.
 
 ## Seeing the map (render, compile, shoot)
 
@@ -140,6 +201,7 @@ camera views for `shoot`, defaults and materials) is in [SKILL.md](SKILL.md).
 python scripts/vmf.py render  maps/mymap.vmf -o plan.png --cut 100        # one floor, roofs removed
 python scripts/vmf.py render  maps/mymap.vmf -o side.png --axis y --slice -64 64
 python scripts/vmf.py compile maps/mymap.vmf --install                     # vbsp + vvis -fast + vrad -fast
+python scripts/vmf.py compile maps/mymap.vmf --mode normal --vis fast      # real lighting, quick vis (big outdoor maps)
 python scripts/vmf.py render  maps/mymap.vmf --leak maps/mymap.lin --focus # after a leak
 python scripts/vmf.py shoot   maps/mymap.vmf --out shots/                  # screenshots from the game
 ```

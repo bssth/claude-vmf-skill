@@ -77,7 +77,21 @@ world
 - A `dispinfo` block inside a side turns it into a **displacement** (terrain):
   `power`, `startposition`, and `normals`/`distances`/`offsets`/`alphas`/
   `triangle_tags`/`allowed_verts` rows (`"row0" ...`). Displacement sides must be
-  4-sided. Leave dispinfo data alone unless you understand it.
+  4-sided. Leave dispinfo data alone unless you understand it (or generate it
+  with the `terrain` shape).
+  - Grid: (2^power + 1)^2 vertices. vbsp takes the face's winding (built from
+    the plane like any brush face), rotates it to start at the corner nearest
+    `startposition` (p0..p3), and puts vertex (row i, column j) at
+    lerp(lerp(p0, p1, i/n), lerp(p3, p2, i/n), j/n), then adds
+    `normals`[i][j] * `distances`[i][j] + `offsets`[i][j]. `"rowI"` holds the
+    values for j = 0..n in order. For a floor face whose start is its min corner
+    this means rows run along +y and columns along +x.
+  - `triangle_tags`: one value per triangle, 2*(n-1) per row, n-1 rows: 9 =
+    walkable + buildable, 1 = walkable, 0 = too steep (Hammer recomputes them).
+  - `alphas` (0..255) blend the second texture of a WorldVertexTransition
+    (blend) material in. `allowed_verts` is `"10" "-1 -1 -1 -1 -1 -1 -1 -1 -1 -1"`.
+  - vbsp removes a displacement's base brush from the world, so displacements
+    neither seal the map nor block visibility.
 
 ## entity (point vs brush)
 

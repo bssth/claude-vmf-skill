@@ -1,6 +1,6 @@
 ---
 name: vmf
-description: Work with Source Engine VMF / Hammer++ map files (.vmf) — inspect, query, validate, surgically edit (keyvalues, I/O connections, materials), generate geometry (brushes, entities, whole greybox blockouts of rooms / corridors / stairs from a JSON layout, holes carved through walls), and SEE the result (render a plan/side view to PNG, compile with vbsp/vvis/vrad and get leaks/errors summarised, screenshot the compiled map in the game). Use whenever a task involves reading, modifying, building, compiling or looking at a .vmf map, Hammer/Hammer++ maps, brushes/solids/sides, entity keyvalues, inputs/outputs (connections), worldspawn, displacements, targetnames, leaks, or level layout. ESSENTIAL for large maps that are too big to read into context.
+description: Work with Source Engine VMF / Hammer++ map files (.vmf) — inspect, query, validate, surgically edit (keyvalues, I/O connections, materials), generate geometry (brushes, entities, whole greybox blockouts of rooms / corridors / stairs from a JSON layout, holes carved through walls, and non-box shapes - rotated boxes, wedges/ramps, cylinders/pipes, cones, rings/tunnels, arches, gable/shed/barrel roofs, polyline walls and fences, displacement terrain with hills), check that materials/models exist in the game's VPKs, and SEE the result (render a plan/side view to PNG, compile with vbsp/vvis/vrad and get leaks/errors summarised, screenshot the compiled map in the game). Use whenever a task involves reading, modifying, building, compiling or looking at a .vmf map, Hammer/Hammer++ maps, brushes/solids/sides, entity keyvalues, inputs/outputs (connections), worldspawn, displacements, targetnames, leaks, or level layout. ESSENTIAL for large maps that are too big to read into context.
 ---
 
 # VMF (Hammer++ map format)
@@ -20,9 +20,10 @@ surgical slices instead.
 
 ## Tooling: `scripts/vmf.py`
 
-Pure-stdlib Python 3.8+ (no dependencies; blockouts, `render` and
-`compile`/`shoot` live in the sibling `vmf_build.py` / `vmf_render.py` /
-`vmf_game.py` but run through `vmf.py`). Paths below are
+Pure-stdlib Python 3.8+ (no dependencies; blockouts, shapes, `render`,
+`compile`/`shoot` and `assets` live in the sibling `vmf_build.py` /
+`vmf_shapes.py` / `vmf_render.py` / `vmf_game.py` / `vmf_assets.py` but run
+through `vmf.py`). Paths below are
 relative to this skill's directory; run it from anywhere with an absolute or
 relative path to the map (use whichever of `python` / `python3` / `py` works on
 the machine). The
@@ -76,6 +77,7 @@ python scripts/vmf.py build    LAYOUT.json OUT.vmf [--overwrite | --append] [--d
 python scripts/vmf.py new-map  OUT.vmf                                                    # empty map (world only)
 python scripts/vmf.py room     MAP.vmf --mins 0 0 0 --maxs 512 384 160 [--door "east c"] [--window "north 64"]
                                [--hole "WALL OFFSET W H [SILL]"] [--wall 16 --floor 16 --ceiling 16] [--light 300]
+                               [--roof gable|shed|barrel|flat --roof-axis x|y --roof-rise 96]
 python scripts/vmf.py corridor MAP.vmf --from 512 192 0 --to 768 192 0 --width 96 --height 112 [--via "X Y Z"]
                                [--from-end auto|open|cap] [--to-end ...] [--light 120]
 python scripts/vmf.py stairs   MAP.vmf --start 1104 40 0 --dir +y (--steps 22 | --top 176) --width 96
@@ -84,8 +86,9 @@ python scripts/vmf.py carve    MAP.vmf --mins X Y Z --maxs X Y Z [--detail]     
 ```
 `room`/`corridor`/`stairs`/`carve` edit MAP in place (all take `--dry-run`, and
 `--material` or `--wall-material`/`--floor-material`/`--ceiling-material`).
-Everything is axis-aligned boxes from `make_box` (the stair clip ramp is the one
-sloped brush), ids from the allocator, and every new brush is checked like
+Rooms, corridors and stairs are axis-aligned boxes from `make_box` (the stair
+clip ramp and room roofs are the sloped exceptions; anything else non-boxy is a
+shape, below), ids from the allocator, and every new brush is checked like
 `lint invalid_brushes` before anything is written.
 
 - **Rooms and corridors are given by their INTERIOR** (the air). Floor, ceiling
@@ -125,21 +128,36 @@ warned about, so typos don't pass silently):
   "visgroup": "blockout",                                                     // "" = none
   "rooms": [{"name": "lobby", "mins": [0, 0, 0], "maxs": [512, 384, 160],    // or "size": [w, d, h]
              "openings": [{"wall": "east", "type": "door|window|hole", "offset": 64, "at": 192,
-                           "width": 64, "height": 112, "sill": 0}],
+                           "width": 64, "height": 112, "sill": 0,
+                           "repeat": {"count": 5, "step": 96}}],             // a row of windows
+             "roof": {"style": "gable", "axis": "y", "rise": 96},             // optional, see Shapes 'roof'
              "light": 300, "nodes": 128}],                                    // 0 = no light; info_node grid
   "corridors": [{"name": "hall", "from": "lobby", "to": "stairwell", "width": 96, "height": 112, "at": 192, "z": 0},
                 {"points": [[544, 64, 0], [672, 64, 0], [672, 640, 0]], "width": 64, "height": 96,
                  "from_end": "auto|open|cap", "to_end": "auto"}],
   "stairs":   [{"start": [1104, 40, 0], "dir": "+y", "steps": 22, "top": 176, "rise": 8, "run": 12,
                 "width": 96, "landing": 80, "clip": true, "base": 0}],
-  "boxes":    [{"mins": [768, 304, 160], "maxs": [1056, 384, 176], "material": "M", "entity": "func_detail"}],
+  "boxes":    [{"mins": [768, 304, 160], "maxs": [1056, 384, 176], "material": "M", "entity": "func_detail",
+                "repeat": {"count": [3, 2], "step": [128, 96]}}],             // count N + step [dx,dy,dz], or a grid
   "carve":    [{"mins": [x, y, z], "maxs": [x, y, z]}],                       // e.g. a hole through a floor
+  "shapes":   [{"type": "cylinder", "base": [0, 0, 0], "height": 256, "radius": 16, "detail": true},
+               {"type": "terrain", "mins": [-4096, -4096], "maxs": [4096, 4096], ...}],   // see Shapes below
   "entities": [{"class": "info_player_start", "origin": [96, 192, 0], "yaw": 0},
                {"class": "npc_citizen", "room": "office", "origin": [64, 0, 0], "look_at": [0, 0, 0], "name": "bob",
                 "kv": {"spawnflags": "0"}},
-               {"class": "light", "origin": [960, 160, 112], "brightness": 200, "color": [255, 255, 255]}],
+               {"class": "light", "origin": [960, 160, 112], "brightness": 200, "color": [255, 255, 255],
+                "repeat": {"count": 4, "step": [256, 0, 0]}},
+               {"class": "logic_relay", "name": "r1", "origin": [0, 0, 64],
+                "outputs": [["OnTrigger", "door1", "Open", "", 0.5, -1]]},   // output, target, input, param, delay, times
+               {"class": "prop_static", "models": ["models/a.mdl", "models/b.mdl"], "yaw": "random",
+                "on_terrain": true, "origin": [0, 0, -8],                      // z = terrain height + origin z
+                "scatter": {"count": 80, "mins": [x, y], "maxs": [x, y],      // or "polygon": [[x, y], ...]
+                            "avoid": [{"mins": [x, y], "maxs": [x, y]}], "min_dist": 200, "seed": 1}}],
   "views":    [{"name": "stairs", "pos": [1104, 8, 64], "look_at": [1104, 384, 200]},   // pos = EYE
-               {"room": "lobby", "corner": "sw|se|nw|ne"}]
+               {"room": "lobby", "corner": "sw|se|nw|ne"}],
+  "prefabs":  {"target": {"boxes": [...], "shapes": [...], "entities": [...]}},  // local coords, origin 0 0 0
+  "place":    [{"prefab": "target", "name": "t{i}", "origin": [x, y, z], "yaw": 90,
+                "vars": {"flags": 578}, "repeat": {"count": 9, "step": [112, 0, 0]}}]
 }
 ```
 - Corridor `from`/`to` are room names (a straight corridor between their facing
@@ -149,11 +167,41 @@ warned about, so typos don't pass silently):
   turns the yaw, except on info_target / point_*). Views become `info_target`s named
   `shot_<name>`, which `shoot` picks up; a `room` view stands in a corner at eye
   height looking at the room's centre.
-- Build order: all room shells, then room openings, corridors, `carve`, stairs,
-  boxes, automatic lights (rooms: a grid with one per `light_spacing` cell, a
-  third of the way down from the ceiling; corridors: dimmer) and nodes, then
-  entities and views. So carves never cut stairs or boxes, and a door between
-  back-to-back rooms goes through both walls.
+- Build order: all room shells (and their roofs), then room openings, corridors,
+  `carve`, stairs, boxes, shapes, automatic lights (rooms: a grid with one per
+  `light_spacing` cell, a third of the way down from the ceiling; corridors:
+  dimmer) and nodes, then entities and views. So carves never cut stairs, boxes
+  or shapes, and a door between back-to-back rooms goes through both walls.
+- **I/O**: `outputs` on entities, entity boxes and entity shapes: each is
+  `[output, target, input, param, delay, times]` (the last three optional) or a
+  dict with those keys; written like Hammer++ (`,`-joined; ESC when a field has
+  a comma). World brushes can't have outputs. `lint` then checks the targets.
+- **Brush entities**: `entity` + `kv` + `name` on a box or shape; `origin` sets
+  the entity origin, which is the hinge / axis of `func_door_rotating`,
+  `func_rot_button`, `func_rotating`. `trigger_*` get `TOOLS/TOOLSTRIGGER` and
+  spawnflags 1 (clients) unless given.
+- **Prefabs**: a named group of `boxes` / `shapes` / `entities` in local
+  coordinates, stamped by `place` entries: moved to `origin`, turned by `yaw`
+  about it (boxes become rotatable box shapes, entity origins and angles turn
+  too), and every string gets `{name}` (the placement's name), `{i}` (its index
+  from 1 across `repeat`) and `vars` substituted, so targetnames and I/O stay
+  unique per copy. Use them for anything repeated with logic (pop-up targets,
+  lamp posts with lights, doors with triggers). Axis-dependent keyvalues (e.g.
+  a rotating entity's axis spawnflag) don't turn with `yaw`: pass them per
+  placement through `vars`.
+- `repeat` works on boxes, shapes, entities, room openings and placements. `models` picks
+  one model per placement (deterministic). `scatter` places an entity at random
+  but reproducible points (`seed`); `on_terrain` drops it onto a terrain shape
+  built in the same layout.
+- A room `roof` sits on the walls (or on the ceiling slab if `ceiling` > 0);
+  with `"ceiling": 0` the roof alone closes the room, and its gable-end infill
+  takes the walls' thickness and material. `roof_material` is a `defaults` key.
+- An **outdoor map** is a big room with `TOOLS/TOOLSSKYBOX` walls and ceiling,
+  `TOOLS/TOOLSNODRAW` floor and `"light": 0`, a `terrain` shape filling its floor
+  (its `thickness` reaching down to the room's floor), buildings as rooms inside
+  it (`"floor": 4` puts a 4-unit slab on the ground), and `light_environment` /
+  `env_sun` / `shadow_control` / `env_fog_controller` in `entities`. Openings
+  that face the outdoor room don't warn: it is an interior too.
 - It prints each room, the corridor end states (open/cap), where each stair run
   ends, and a WARN for every opening or open corridor end that leads to no room
   (that's a leak: put a room or a sealed box behind it).
@@ -167,6 +215,69 @@ fix the JSON, rebuild. Rebuilding replaces the file, so keep changes in the
 JSON, not in Hammer, until the layout settles; `--append` puts a layout into an
 existing map once (run it again and you get a second copy).
 
+### Shapes: brushes that aren't boxes
+```
+python scripts/vmf.py shape MAP.vmf '{"type": "arch", ...}' ['{...}' ...] [--dry-run]   # or @specs.json (a list)
+```
+The same spec objects go in a layout's `"shapes"` list. vbsp only takes convex
+brushes, so every shape is cut into convex pieces that share faces exactly
+(each face plane comes from three of its vertices chosen from the point set, so
+neighbours get identical opposite planes: no cracks). Vertices are rounded to
+1/1000 (`"snap": 1` snaps to whole units); `vertices_plus` is computed from the
+final planes.
+
+| type | keys (besides the common ones) |
+|---|---|
+| `box` | `mins`+`maxs` or `center`+`size`; rotate with `yaw`/`pitch`/`roll` |
+| `prism` | `points` (convex footprint [[x,y],...]), `z` |
+| `wedge` | `mins`, `maxs`, `up` (+x/-x/+y/-y: the side that is high), `low` (height kept at the low end); reports the slope (walkable up to ~45 deg) |
+| `cylinder` | `base`+`height` (vertical) or `from`+`to` (any direction: pipes, logs, bars), `radius`, `sides` (auto 8..32), `align` flat/point |
+| `cone` | like cylinder + `top_radius` (0 = pointed; else a frustum) |
+| `ring` | like cylinder (or `center`+`axis`+`length`) + `radius`, `inner` or `thickness`, `arc` [a0, a1] deg: curved walls, tyres, tunnels/barrel vaults (horizontal axis: 0 = horizontal, 90 = up) |
+| `arch` | wall from `from` to `to` ([x,y]), `z` [z0,z1], `thickness`, `align` center/left/right, `openings`: [{`at` (distance along the wall), `width`, `height` (to the crown), `rise` (default = half width: round arch; less = segmental), `sill`}], `segments` |
+| `roof` | `style` gable/shed/barrel/flat, footprint `mins`/`maxs` [x,y] (outside of the walls), eave `z`, `axis` x/y (ridge direction), `rise` or `pitch` (deg), `up` (shed: the high side), `overhang`, `end_overhang`, `thickness`, `gables` (end-wall infill: true / {thickness, material} / false), `segments` (barrel) |
+| `wall` | `points` [[x,y],...], `z`, `thickness`, `closed`, `align` center/left/right, `gaps` [[d0,d1],...] (distances along the polyline: doorways); mitered corners |
+| `fence` | a `wall` preset: thickness 4, `METAL/METALFENCE001A` both sides, nodraw top/bottom, func_detail, `posts` spacing (default 128), `post_size`, `post_material` |
+| `railing` | `points`, `z` (the floor it stands on), `height` (40), `rails` (2), `rail_size`, `posts` spacing (64), `post_size`, `closed`, `gaps`; see-through, func_detail |
+| `terrain` | `mins`/`maxs` [x,y] (whole `tile`s, default 512), `z`, `power` 2-4, `thickness`, `material` (a blend material for alpha), `flat_material`, `hills` [{`at`,`radius`,`height`,`shape` smooth/cone/gauss}], `ridges` [{`points`,`width`,`height`}], `noise` {`amp`,`scale`,`seed`,`octaves`}, `edge` {`height`,`width`} (a rim rising toward the rectangle's sides: hides the sky walls), `flat` [{`mins`,`maxs` or `polygon`, `blend`}] (height forced to 0 inside, blended outside), `clamp`, `alpha` {`from`,`to`} (paint layer 2 where the slope's normal z goes from..to), `skip_flat` (default true: flat tiles become plain brushes) |
+
+Common keys: `material`, `materials` (by face tag: `top`/`bottom`/`side`, and
+`outer`/`inner`/`end` on rings), `entity` (e.g. `func_detail`,
+`func_breakable`) + `kv` + `name`, `detail: true` (= func_detail), `snap`,
+`yaw`/`pitch`/`roll` + `pivot` (rotation, default about the bbox centre),
+`repeat`, `tex_scale`, `lightmapscale`. Textures are world-aligned, projected
+into sloped faces.
+
+- **Displacements don't seal the map** and don't block vis (vbsp drops a
+  displacement's base brush entirely): keep the sky room's floor (or other
+  brushes) under a terrain.
+- A `fast` compile shows **dark seams along terrain tile edges** (vrad -fast
+  lighting); `--mode normal` / `final` lights them smoothly. Not a geometry
+  problem: don't "fix" the heights.
+- Terrain heights are computed from world x/y, so tile edges always match; the
+  grid follows vbsp's own face winding (rows from the start corner along the
+  face's second vertex), checked against the compiled BSP.
+- `fence`'s default material is `$translucent` with `%compilepassbullets`
+  (bullets go through it) and the fence lives in func_detail, so it doesn't cut
+  vis or seal anything either.
+
+### Assets: does the game have it?
+```
+python scripts/vmf.py assets 'materials/metal/*fence*.vmt' 'models/props_foliage/*pine*.mdl' [--where] [--limit N]
+python scripts/vmf.py assets --color 'materials/wood/woodwall*.vmt'   # + each material's average colour
+python scripts/vmf.py assets --missing MAP.vmf      # materials / models / sky / vscripts / soundscapes the game can't find (exit 1 if any)
+python scripts/vmf.py assets --paths                # the gameinfo.txt search paths used
+```
+Reads the mod's `gameinfo.txt` `game` search paths, loose folders and VPK
+directories (no extraction), so it sees exactly what the engine mounts.
+`--color` reads the average colour stored in each base texture's VTF header
+(HL2's `DEV/DEV_MEASUREWALL01A/B/C`, `GENERIC01`, `CRATE*` are all orange;
+`GENERIC01B` and `WALL01D` are grey): pick a greybox palette whose parts read
+apart. Pick materials and models with it **before** writing them into a layout, and run
+`--missing` before compiling: a wrong name is a purple checkerboard or an error
+model in game, and vbsp deletes `prop_static`s whose model can't be static
+(e.g. `models/props_vehicles/apc001.mdl` needs `prop_dynamic`).
+
 ### See it: render → compile → shoot
 You can't judge geometry from coordinates. Look at it, then open the PNG/JPGs
 with the Read tool (they are images).
@@ -174,15 +285,18 @@ with the Read tool (they are images).
 python scripts/vmf.py render  MAP.vmf -o plan.png [--cut Z | --z-range Z1 Z2] [--axis z|x|y] [--slice A B]
                               [--bbox X1 Y1 X2 Y2] [--class/--targetname/--kv SEL --focus [MARGIN]]
                               [--leak MAP.lin] [--mark "x y z:label"] [--views views.txt] [--size 1600]
-python scripts/vmf.py compile MAP.vmf [--mode fast|normal|final] [--no-vis] [--no-rad] [--hdr] [--install]
-python scripts/vmf.py shoot   MAP.vmf [--views views.txt] [--view "name x y z pitch yaw"] [--out DIR]
+python scripts/vmf.py compile MAP.vmf [--mode fast|normal|final] [--vis fast|full] [--no-vis] [--no-rad] [--hdr] [--install]
+python scripts/vmf.py shoot   MAP.vmf [--views views.txt] [--view "name x y z pitch yaw [| cmd; cmd]"] [--out DIR]
+                              [--exec "console cmd"] [--hud] [--cmd-wait 1]
 python scripts/vmf.py game-paths [MAP.vmf]     # which tools / game dir / hl2.exe will be used
 ```
 - **render**: plan view by default (`--axis x|y` = side views). Brushes are filled
   by kind (world, nodraw, detail, brush entity, displacement, water) and shaded by
   height/depth; triggers hatched, clips dashed, sky/areaportals outlined, invalid
   brushes red. Entities: player start (green, with facing arrow), NPCs (red,
-  arrow), lights, props, items, logic, info_node dots, `shot_*` cameras. A
+  arrow), lights, props, items, logic, info_node dots, `shot_*` cameras;
+  displacements are drawn as their real displaced surface, cell by cell, shaded
+  by height (a side view shows the terrain profile). A
   labelled grid plus the printed `pixel->world` formula let you read coordinates
   back. A plain top view shows **roofs**: use `--cut Z` (drop everything above Z)
   or `--z-range` to see one floor. The 3D skybox is left out of the frame
@@ -192,7 +306,9 @@ python scripts/vmf.py game-paths [MAP.vmf]     # which tools / game dir / hl2.ex
   status, errors/warnings grouped by kind with counts, the fullest BSP limits, and
   on a leak: the entity, the `.lin` pointfile and the `render --leak` command to
   look at it (vvis is skipped on a leak). `fast` (default) is for iteration;
-  `final` = full vis, `vrad -final`, LDR+HDR. Exit code != 0 on a leak, a failed
+  `final` = full vis, `vrad -final`, LDR+HDR; `--vis fast` keeps vvis quick in
+  any mode (a full vis of a big open outdoor map can take tens of minutes, and
+  screenshots only need the lighting). Exit code != 0 on a leak, a failed
   tool, or a limit at 100%. `--install` copies the bsp into `<game>/maps` (it never
   replaces a map it didn't put there unless `--overwrite`). Full output: the
   tools' own `MAP.log` next to the map.
@@ -204,7 +320,16 @@ python scripts/vmf.py game-paths [MAP.vmf]     # which tools / game dir / hl2.ex
   yaw CCW from +X): a file of `name x y z pitch yaw [roll]` lines, `--view`, or
   automatic: player start looking 4 ways + every `point_viewcontrol` + every
   entity named `shot_*` (drop an `info_target` named `shot_<what>` with `angles`
-  into the map to add a view). Needs Steam running and the game closed; takes
+  into the map to add a view). **Testing logic**: text after `|` in a view runs
+  as console commands after the camera is placed and before the shot (waits
+  `--cmd-wait` s more): `"t_fall 0 900 80 10 90 | ent_fire range_n1 press"`;
+  `--exec` runs commands once after load; `--hud` keeps game_text / HUD visible;
+  script `printl` output lands in `<game>/console.log` (appended across runs:
+  read from the last `Redownloading all lightmaps`). Quote console arguments
+  that contain `( ) ' :` (`ent_fire s runscriptcode "Go()"`): the console
+  tokenizer splits on them. Outputs a command triggers run a tick later than
+  the next `ent_fire` in the same view: check their results in the next view.
+  Needs Steam running and the game closed; takes
   ~20 s to load plus ~1 s per view. Restores `cfg/config.cfg` afterwards.
   `--fullbright` for maps compiled with `--no-rad`.
 - Paths are auto-detected (game dir = nearest folder above the map with
@@ -224,6 +349,11 @@ python scripts/vmf.py game-paths [MAP.vmf]     # which tools / game dir / hl2.ex
   to an existing map → **`room` / `corridor` / `stairs`** with `--dry-run` first.
 - A door, window or stairwell hole through existing walls / floors → **`carve`**
   (axis-aligned brushes only; it lists what it couldn't cut).
+- Anything round, sloped, angled or curved (ramps, columns, pipes, arches,
+  roofs, angled walls, fences, hills) → **a `shapes` entry / `shape`**, never
+  hand-computed planes.
+- Choosing a material or model → **`assets PATTERN`** first; after building →
+  **`assets --missing`**.
 - Changing a keyvalue / I/O on entities → **vmf.py set-kv / add-io / rm-io** (safe with repeated keys; preview with `--dry-run`).
 - A one-off change to a single, textually-unique line you already located → a manual **Edit** is fine.
 - **After building or moving geometry → render and look** (plan with `--cut`, a

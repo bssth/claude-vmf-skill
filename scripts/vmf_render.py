@@ -384,12 +384,27 @@ def _hull(points):
 
 
 class Brush:
-    __slots__ = ("solid", "ent", "cls", "kind", "valid", "mins", "maxs", "hull", "near", "id")
+    __slots__ = ("solid", "ent", "cls", "kind", "valid", "mins", "maxs", "hull", "near", "id", "quads")
 
     def __init__(self, solid, ent, cls, kind, valid, pts, axis):
         ui, vi, di, ds, _ = _AXES[axis]
         self.solid, self.ent, self.cls, self.kind, self.valid = solid, ent, cls, kind, valid
         self.id = solid.get("id")
+        self.quads = None
+        if kind == "disp":
+            # draw the displaced surface itself (cell by cell) instead of the base brush
+            quads = []
+            for side, w in vmf.solid_windings(solid):
+                grid = vmf.disp_grid(side, w)
+                if grid is None:
+                    continue
+                n = len(grid)
+                for i in range(n - 1):
+                    for j in range(n - 1):
+                        cell = (grid[i][j], grid[i][j + 1], grid[i + 1][j + 1], grid[i + 1][j])
+                        quads.append(([(c[ui], c[vi]) for c in cell], max(ds * c[di] for c in cell)))
+                pts = list(pts) + [c for row in grid for c in row]
+            self.quads = quads or None
         self.mins = tuple(min(p[i] for p in pts) for i in range(3))
         self.maxs = tuple(max(p[i] for p in pts) for i in range(3))
         self.hull = _hull([(p[ui], p[vi]) for p in pts])
@@ -623,12 +638,23 @@ def _cmd_render(args):
 
     for b in sky:
         cv.polyline([P(*p) for p in b.hull], KINDS["sky"][0])
+    # displacements are drawn cell by cell, shaded by each cell's own height,
+    # depth-sorted together with the brushes
+    draw = []
     for b in fills:
-        col = KINDS[b.kind][0]
-        f = 0.5 + 0.5 * (b.near - dmin) / drange
-        poly = [P(*p) for p in b.hull]
+        if b.quads:
+            for q, near in b.quads:
+                draw.append((near, 1, q, b.kind))
+        else:
+            draw.append((b.near, 0, b.hull, b.kind))
+    draw.sort(key=lambda d: d[0])
+    for near, is_cell, hull, kind in draw:
+        col = KINDS[kind][0]
+        f = 0.5 + 0.5 * (near - dmin) / drange
+        poly = [P(*p) for p in hull]
         cv.fill_poly(poly, shade(col, f))
-        cv.polyline(poly, shade(col, f * 0.62))
+        if not is_cell:
+            cv.polyline(poly, shade(col, f * 0.62))
     for b in tools:
         col, style = KINDS[b.kind]
         poly = [P(*p) for p in b.hull]

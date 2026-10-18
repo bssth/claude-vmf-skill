@@ -323,7 +323,8 @@ def _cmd_compile(args):
     else:
         steps.append(("vbsp", threads + game + [base]))
         if not args.no_vis:
-            steps.append(("vvis", (["-fast"] if args.mode == "fast" else []) + threads + game + [base]))
+            fast_vis = (args.vis or ("fast" if args.mode == "fast" else "full")) == "fast"
+            steps.append(("vvis", (["-fast"] if fast_vis else []) + threads + game + [base]))
         if not args.no_rad:
             rad = {"fast": ["-fast", "-bounce", "2", "-noextra"], "normal": [], "final": ["-final"]}[args.mode]
             steps.append(("vrad", rad + ["-ldr"] + threads + game + [base]))
@@ -413,6 +414,9 @@ def parse_views(path):
 
 
 def parse_view(text, where="--view"):
+    """`name x y z pitch yaw [roll] [| console cmd; cmd ...]`: commands after a
+    `|` run after the camera is placed, before the shot (ent_fire, impulse...)."""
+    text, _, cmds = text.partition("|")
     parts = text.replace(",", " ").split()
     try:
         nums = [float(v) for v in parts[1:]]
@@ -422,7 +426,8 @@ def parse_view(text, where="--view"):
         print(f"{where}: want 'name x y z pitch yaw [roll]', got {text!r}", file=sys.stderr)
         sys.exit(2)
     roll = nums[5] if len(nums) == 6 else 0.0
-    return {"name": parts[0], "pos": tuple(nums[0:3]), "ang": (nums[3], nums[4], roll)}
+    cmds = [c.strip() for c in cmds.split(";") if c.strip()]
+    return {"name": parts[0], "pos": tuple(nums[0:3]), "ang": (nums[3], nums[4], roll), "cmds": cmds}
 
 
 def auto_views(doc):
@@ -554,6 +559,7 @@ def _cmd_shoot(args):
         setup.append("mat_fullbright 1")
     if args.fov:
         setup.append("fov_desired %d" % args.fov)
+    setup += list(args.exec or [])
     setup.append("echo VMFSHOOT_SETUP_DONE")
     with open(setup_cfg, "w", encoding="ascii", newline="\n") as f:
         f.write("\n".join(setup) + "\n")
@@ -593,16 +599,20 @@ def _cmd_shoot(args):
         if not wait_log("VMFSHOOT_SETUP_DONE", 30, proc):
             raise RuntimeError("the game didn't run the setup cfg (is -hijack supported?)")
         time.sleep(args.start_delay)
-        def take(v):
-            """Move the camera, shoot, and read back where the camera really was.
+        def take(v, with_cmds=True):
+            """Move the camera (and run the view's commands, unless this is a
+            retake), shoot, and read back where the camera really was.
             Returns (screenshot file name or None, camera tuple or None)."""
             x, y, z = v["pos"]
             p, yw, r = v["ang"]
+            cmds = (v.get("cmds") or []) if with_cmds else []
             with open(view_cfg, "w", encoding="ascii", newline="\n") as f:
                 f.write("setpos %s %s %s\nsetang %s %s %s\n"
                         % (_fmt(x), _fmt(y), _fmt(z - args.eye_height), _fmt(p), _fmt(yw), _fmt(r)))
+                for c in cmds:
+                    f.write(c + "\n")
             hijack("+exec", "vmfshoot_view")
-            time.sleep(args.settle)
+            time.sleep(args.settle + (args.cmd_wait if cmds else 0))
             log_mark = len(log.text())
             hijack("+getpos", "+jpeg")  # getpos prints the eye position/angles the shot is taken from
             t0 = time.time()
@@ -629,7 +639,7 @@ def _cmd_shoot(args):
 
         for i, v in enumerate(views):
             for attempt in range(3):
-                got, cam = take(v)
+                got, cam = take(v, with_cmds=(attempt == 0))
                 if got is None or cam is None or not off_by(v, cam):
                     break
                 os.remove(os.path.join(shots_dir, got))  # the camera drifted; shoot again
@@ -695,6 +705,9 @@ def add_parsers(sub):
     sp.add_argument("file")
     sp.add_argument("--mode", choices=("fast", "normal", "final"), default="fast",
                     help="fast: vvis -fast, vrad -fast -bounce 2 (default); final: full vis, vrad -final, LDR+HDR")
+    sp.add_argument("--vis", choices=("fast", "full"),
+                    help="override the mode's vvis pass (e.g. --mode normal --vis fast: real lighting without a "
+                         "long full vis on big open maps)")
     sp.add_argument("--no-vis", action="store_true", help="skip vvis")
     sp.add_argument("--no-rad", action="store_true", help="skip vrad (the map renders fullbright)")
     sp.add_argument("--hdr", action="store_true", help="also compile HDR lighting")
@@ -726,6 +739,10 @@ def add_parsers(sub):
     sp.add_argument("--overwrite", action="store_true", help="replace a same-named map in <game>/maps")
     sp.add_argument("--keep-open", action="store_true", help="leave the game running afterwards")
     sp.add_argument("--extra-args", help="extra game command line arguments")
+    sp.add_argument("--exec", action="append", metavar="CMD",
+                    help="console command run once after the map loads, before the shots (repeatable)")
+    sp.add_argument("--cmd-wait", type=float, default=1.0,
+                    help="extra seconds to wait after a view's own '| commands' before its shot")
     _add_path_args(sp)
     sp.set_defaults(func=_cmd_shoot)
 

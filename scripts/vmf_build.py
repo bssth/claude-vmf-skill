@@ -46,6 +46,7 @@ DEFAULTS = {
     "ceiling_material": "DEV/DEV_MEASUREGENERIC01",
     "stairs_material": "DEV/DEV_MEASUREGENERIC01B",
     "box_material": "DEV/DEV_MEASUREGENERIC01",
+    "roof_material": "DEV/DEV_MEASUREGENERIC01B",
     "clip_material": "TOOLS/TOOLSPLAYERCLIP",
     "light": 300,                 # brightness of automatic room lights; 0 = none
     "corridor_light": 120,        # brightness of automatic corridor lights; 0 = none
@@ -479,6 +480,37 @@ def add_entity(doc, alloc, cls, kvs=(), origin=None, color="220 30 220", visgrou
     return ent
 
 
+def add_outputs(ent, outputs, where="entity"):
+    """Append I/O connections to an entity. Each output is a list
+    [output, target, input, param, delay, times] (the last three optional) or a
+    dict with those keys. Fields are joined with ',' like Hammer++ writes them,
+    or with ESC when a field itself contains a comma."""
+    if not outputs:
+        return 0
+    if not isinstance(outputs, list):
+        raise BuildError(f"{where}: 'outputs' wants a list")
+    conns = ent.first("connections")
+    n = 0
+    for i, o in enumerate(outputs):
+        if isinstance(o, dict):
+            f = [o.get("output"), o.get("target"), o.get("input"), o.get("param", ""), o.get("delay", 0),
+                 o.get("times", -1)]
+        elif isinstance(o, (list, tuple)) and 3 <= len(o) <= 6:
+            f = list(o) + ["", 0, -1][len(o) - 3:]
+        else:
+            raise BuildError(f"{where}.outputs[{i}]: want [output, target, input, param, delay, times]")
+        if not f[0] or not f[1] or not f[2]:
+            raise BuildError(f"{where}.outputs[{i}]: output, target and input are required")
+        vals = [str(f[1]), str(f[2]), str(f[3]), str(num(f[4])), str(int(f[5]))]
+        sep = "\x1b" if any("," in v for v in vals) else ","
+        if conns is None:
+            conns = Node("connections", [])
+            ent.insert_child_before_editor(conns)
+        conns.add_kv(str(f[0]), sep.join(vals))
+        n += 1
+    return n
+
+
 def light_kvs(brightness, color):
     c = list(color) + [255] * (3 - len(color))
     return [("_light", "%d %d %d %d" % (c[0], c[1], c[2], brightness)), ("_lightHDR", "-1 -1 -1 1"),
@@ -572,8 +604,30 @@ def auto_lights(geo, box, brightness, color, spacing, z):
 # ---------------------------------------------------------------------------
 
 ROOM_KEYS = {"name", "mins", "maxs", "size", "wall", "floor", "ceiling", "material", "wall_material",
-             "floor_material", "ceiling_material", "openings", "light", "light_color", "nodes"}
-OPENING_KEYS = {"wall", "type", "offset", "at", "width", "height", "sill"}
+             "floor_material", "ceiling_material", "openings", "light", "light_color", "nodes", "roof"}
+OPENING_KEYS = {"wall", "type", "offset", "at", "width", "height", "sill", "repeat"}
+
+
+def expand_openings(ops, where):
+    """Openings with "repeat": {"count": N, "step": S} become N openings, each
+    S further along the wall ('at' or 'offset' must be a number)."""
+    out = []
+    for i, op in enumerate(ops or []):
+        if not isinstance(op, dict):
+            raise BuildError(f"{where}.openings[{i}]: want an object")
+        rp = op.get("repeat")
+        if not rp:
+            out.append((i, op))
+            continue
+        n, step = int(rp.get("count", 1)), float(rp.get("step", 0))
+        key = "at" if "at" in op else "offset"
+        if not isinstance(op.get(key), (int, float)):
+            raise BuildError(f"{where}.openings[{i}]: 'repeat' needs a numeric 'at' or 'offset'")
+        for k in range(n):
+            o = {kk: vv for kk, vv in op.items() if kk != "repeat"}
+            o[key] = float(op[key]) + k * step
+            out.append((i, o))
+    return out
 
 
 def opening_hole(interior, wall_t, op, where):
@@ -638,9 +692,36 @@ def add_room(geo, spec, d, where="room", warn=print, openings=True):
     for box, mat in parts:
         geo.add_box(mkbox(box[:3], box[3:]), mat)
     info = {"interior": interior, "openings": [], "brushes": len(parts)}
+    roof = spec.get("roof")
+    if roof:
+        info["brushes"] += add_room_roof(geo, spec, d, roof, interior, w, c, where, warn)
     if openings:
         info["openings"] = add_room_openings(geo, spec, d, info, where, warn)
     return info
+
+
+def add_room_roof(geo, spec, d, roof, interior, w, c, where, warn):
+    """A roof (vmf_shapes 'roof' spec minus the footprint) over the room's outer
+    walls, sitting on the walls (or on the ceiling slab when there is one). The
+    gable-end infill gets the walls' thickness and material."""
+    import vmf_shapes
+    if roof is True:
+        roof = {}
+    if not isinstance(roof, dict):
+        raise BuildError(f"{where}: 'roof' wants an object (vmf_shapes roof keys) or true")
+    x0, y0, z0, x1, y1, z1 = interior
+    rs = {"type": "roof", "style": "gable", "material": d.get("roof_material", DEFAULTS["roof_material"])}
+    rs.update(roof)
+    rs["mins"], rs["maxs"] = [x0 - w, y0 - w], [x1 + w, y1 + w]
+    rs.setdefault("z", z1 + c)
+    g = rs.get("gables", True)
+    if g:
+        g = dict(g) if isinstance(g, dict) else {}
+        g.setdefault("thickness", w or 16)
+        g.setdefault("material", _mat(spec, d, "wall"))
+        rs["gables"] = g
+    rep = vmf_shapes.add_shape(geo, rs, d, where + ".roof", warn)
+    return rep["brushes"]
 
 
 def add_room_openings(geo, spec, d, info, where="room", warn=print):
@@ -649,10 +730,8 @@ def add_room_openings(geo, spec, d, info, where="room", warn=print):
     interior = info["interior"]
     w = _thick(spec, d, "wall")
     out = []
-    for i, op in enumerate(spec.get("openings") or []):
+    for i, op in expand_openings(spec.get("openings"), where):
         ow = f"{where}.openings[{i}]"
-        if not isinstance(op, dict):
-            raise BuildError(f"{ow}: want an object")
         _check_keys(op, OPENING_KEYS, ow, warn)
         if not w:
             raise BuildError(f"{ow}: the room has no walls (wall 0)")
@@ -975,10 +1054,137 @@ def add_stairs(geo, spec, d, where="stairs", warn=print):
 # build
 # ---------------------------------------------------------------------------
 
-TOP_KEYS = {"defaults", "world", "visgroup", "rooms", "corridors", "stairs", "boxes", "carve", "entities", "views"}
-BOX_KEYS = {"name", "mins", "maxs", "size", "material", "entity"}
+TOP_KEYS = {"defaults", "world", "visgroup", "rooms", "corridors", "stairs", "boxes", "carve", "shapes",
+            "entities", "views", "prefabs", "place"}
+PREFAB_KEYS = {"boxes", "shapes", "entities", "comment"}
+PLACE_KEYS = {"prefab", "origin", "yaw", "name", "repeat", "vars", "comment"}
+
+
+def _substitute(v, names):
+    """Replace {key} placeholders in every string of a JSON value."""
+    if isinstance(v, str):
+        return re.sub(r"\{(\w+)\}", lambda m: str(names[m.group(1)]) if m.group(1) in names else m.group(0), v)
+    if isinstance(v, list):
+        return [_substitute(x, names) for x in v]
+    if isinstance(v, dict):
+        return {k: _substitute(x, names) for k, x in v.items()}
+    return v
+
+
+def expand_prefabs(spec, warn):
+    """Turn the layout's 'place' entries into extra shape and entity specs.
+
+    A prefab is a group of boxes / shapes / entities in local coordinates (its
+    origin is 0 0 0). Each placement moves it to 'origin', turns it by 'yaw'
+    about that origin, and fills {name} (the placement's name), {i} (its index,
+    from 1, across 'repeat') and any 'vars' into every string, so targetnames
+    and I/O targets stay unique per copy. Boxes become rotatable box shapes."""
+    import vmf_shapes
+    prefabs = spec.get("prefabs") or {}
+    if not isinstance(prefabs, dict):
+        raise BuildError("'prefabs' wants an object of name -> {boxes, shapes, entities}")
+    shapes, ents, count = [], [], 0
+    for pi, pl0 in enumerate(_list(spec, "place")):
+        where = f"place[{pi}]"
+        _check_keys(pl0, PLACE_KEYS, where, warn)
+        pname = pl0.get("prefab")
+        if pname not in prefabs:
+            raise BuildError(f"{where}: no prefab named {pname!r}")
+        pf = prefabs[pname]
+        _check_keys(pf, PREFAB_KEYS, f"prefabs['{pname}']", warn)
+        for k, pl in enumerate(vmf_shapes.expand_repeat(pl0, where), start=1):
+            org = _vec(pl.get("origin", [0, 0, 0]), 3, where + ".origin")
+            yaw = float(pl.get("yaw", 0))
+            names = {"i": k}
+            names.update({kk: vv for kk, vv in (pl.get("vars") or {}).items()})
+            names["name"] = _substitute(str(pl.get("name", f"{pname}{k}")), names)
+            xf = {"yaw": yaw, "origin": org}
+            rot = vmf_shapes._rotation({"yaw": yaw})
+
+            def place_pt(p):
+                q = vmf_shapes._apply(rot, (0.0, 0.0, 0.0), tuple(p)) if rot else tuple(p)
+                return [num(q[0] + org[0]), num(q[1] + org[1]), num(q[2] + org[2])]
+            for b in pf.get("boxes") or []:
+                s = {"type": "box", "mins": b.get("mins"), "maxs": b.get("maxs")}
+                if "size" in b:
+                    s["maxs"] = [float(b["mins"][j]) + float(b["size"][j]) for j in range(3)]
+                for key in ("material", "entity", "kv", "name", "outputs", "repeat", "origin", "detail"):
+                    if key in b:
+                        s[key] = b[key]
+                s["_xform"] = xf
+                shapes.append(_substitute(s, names))
+            for s0 in pf.get("shapes") or []:
+                if str(s0.get("type", "")).lower() == "terrain":
+                    raise BuildError(f"prefabs['{pname}']: terrain can't be placed as a prefab")
+                s = dict(s0)
+                s["_xform"] = xf
+                shapes.append(_substitute(s, names))
+            for e0 in pf.get("entities") or []:
+                e = _substitute(dict(e0), names)
+                if e.get("scatter"):
+                    raise BuildError(f"prefabs['{pname}']: 'scatter' isn't supported inside a prefab")
+                e["origin"] = place_pt(_vec(e.get("origin", [0, 0, 0]), 3, f"prefabs['{pname}'].origin"))
+                if "look_at" in e:
+                    e["look_at"] = place_pt(_vec(e["look_at"], 3, f"prefabs['{pname}'].look_at"))
+                elif "angles" in e:
+                    a = _vec(e["angles"], 3, f"prefabs['{pname}'].angles")
+                    e["angles"] = [a[0], (a[1] + yaw) % 360, a[2]]
+                elif isinstance(e.get("yaw"), (int, float)):
+                    e["yaw"] = (float(e["yaw"]) + yaw) % 360
+                elif yaw:
+                    e["yaw"] = yaw % 360
+                if e.get("repeat"):
+                    raise BuildError(f"prefabs['{pname}']: use 'repeat' on the placement, not on prefab entities")
+                ents.append(e)
+            count += 1
+    return shapes, ents, count
+BOX_KEYS = {"name", "mins", "maxs", "size", "material", "entity", "repeat", "kv", "outputs"}
 CARVE_KEYS = {"name", "mins", "maxs", "size"}
-ENTITY_KEYS = {"class", "name", "origin", "room", "angles", "yaw", "look_at", "kv", "brightness", "color"}
+ENTITY_KEYS = {"class", "name", "origin", "room", "angles", "yaw", "pitch", "look_at", "kv", "brightness", "color",
+               "model", "models", "repeat", "scatter", "on_terrain", "outputs"}
+SCATTER_KEYS = {"count", "mins", "maxs", "polygon", "avoid", "min_dist", "seed"}
+
+
+def scatter_points(sc, where, warn):
+    """Deterministic random (x, y) points inside a rectangle or polygon, at
+    least min_dist apart, outside every 'avoid' rectangle / polygon."""
+    import random
+    import vmf_shapes
+    _check_keys(sc, SCATTER_KEYS, where, warn)
+    rng = random.Random(int(sc.get("seed", 1)))
+    count = int(sc.get("count", 10))
+    if "polygon" in sc:
+        poly = [tuple(_vec(p, 2, where + ".polygon")) for p in sc["polygon"]]
+        bx = (min(p[0] for p in poly), min(p[1] for p in poly), max(p[0] for p in poly), max(p[1] for p in poly))
+        inside = lambda x, y: vmf_shapes._point_in_poly(x, y, poly)  # noqa: E731
+    else:
+        mn, mx = _vec(sc.get("mins"), 2, where + ".mins"), _vec(sc.get("maxs"), 2, where + ".maxs")
+        bx = (min(mn[0], mx[0]), min(mn[1], mx[1]), max(mn[0], mx[0]), max(mn[1], mx[1]))
+        inside = lambda x, y: True  # noqa: E731
+    avoid = []
+    for i, a in enumerate(sc.get("avoid") or []):
+        if "polygon" in a:
+            avoid.append(("p", [tuple(_vec(p, 2, f"{where}.avoid[{i}]")) for p in a["polygon"]]))
+        else:
+            mn, mx = _vec(a.get("mins"), 2, f"{where}.avoid[{i}].mins"), _vec(a.get("maxs"), 2, f"{where}.avoid[{i}].maxs")
+            avoid.append(("r", (min(mn[0], mx[0]), min(mn[1], mx[1]), max(mn[0], mx[0]), max(mn[1], mx[1]))))
+    md = float(sc.get("min_dist", 0))
+    pts = []
+    for _ in range(count * 60):
+        if len(pts) >= count:
+            break
+        x, y = rng.uniform(bx[0], bx[2]), rng.uniform(bx[1], bx[3])
+        if not inside(x, y):
+            continue
+        if any((k == "r" and s[0] <= x <= s[2] and s[1] <= y <= s[3]) or
+               (k == "p" and vmf_shapes._point_in_poly(x, y, s)) for k, s in avoid):
+            continue
+        if md and any((x - px) ** 2 + (y - py) ** 2 < md * md for px, py in pts):
+            continue
+        pts.append((x, y))
+    if len(pts) < count:
+        warn(f"{where}: only {len(pts)} of {count} points fit (min_dist / avoid too tight)")
+    return [(num(x), num(y)) for x, y in pts], rng
 VIEW_KEYS = {"name", "pos", "look_at", "pitch", "yaw", "angles", "room", "corner"}
 
 
@@ -1041,6 +1247,7 @@ def build(doc, spec, warn=print):
     vg = spec.get("visgroup", "blockout")
     visgroup = ensure_visgroup(doc, vg) if vg else None
     geo = Geo(doc, alloc, visgroup)
+    prefab_shapes, prefab_ents, report["placed"] = expand_prefabs(spec, w)
     geo.next_node = 1 + max([int(e.get("nodeid")) for e in vmf.iter_entities(doc)
                              if (e.get("nodeid") or "").isdigit()] or [0])
     rooms, interiors = {}, []
@@ -1084,20 +1291,45 @@ def build(doc, spec, warn=print):
         info = add_stairs(geo, s, d, f"stairs[{i}] '{name}'", w)
         report["stairs"].append({"name": name, **info})
 
-    for i, bspec in enumerate(_list(spec, "boxes")):
+    import vmf_shapes
+    for i, bspec0 in enumerate(_list(spec, "boxes")):
         where = f"boxes[{i}]"
-        _check_keys(bspec, BOX_KEYS, where, w)
-        b = _interior(bspec, where)
-        mat = bspec.get("material") or d["box_material"]
-        cls = bspec.get("entity")
-        if cls:
-            ent = add_entity(doc, alloc, cls, [], None, visgroup=visgroup)
-            s = vmf.make_box(b[:3], b[3:], mat, alloc)
-            _set_editor(s, editor_block("0 180 137", visgroup))
-            ent.insert_child_before_editor(s)
-        else:
-            geo.add_box(b, mat)
-        report["boxes"] += 1
+        _check_keys(bspec0, BOX_KEYS, where, w)
+        for bspec in vmf_shapes.expand_repeat(bspec0, where):
+            b = _interior(bspec, where)
+            mat = bspec.get("material") or d["box_material"]
+            cls = bspec.get("entity")
+            if cls:
+                kvs = [("targetname", bspec["name"])] if bspec.get("name") else []
+                if cls.startswith("trigger_"):
+                    kvs.append(("spawnflags", "1"))
+                    if not bspec.get("material"):
+                        mat = "TOOLS/TOOLSTRIGGER"
+                for k, v in (bspec.get("kv") or {}).items():
+                    kvs = [kv for kv in kvs if kv[0] != k] + [(k, str(v))]
+                ent = add_entity(doc, alloc, cls, kvs, None, visgroup=visgroup)
+                s = vmf.make_box(b[:3], b[3:], mat, alloc)
+                _set_editor(s, editor_block("0 180 137", visgroup))
+                ent.insert_child_before_editor(s)
+                report["io"] = report.get("io", 0) + add_outputs(ent, bspec.get("outputs"), where)
+            else:
+                if bspec.get("outputs"):
+                    raise BuildError(f"{where}: 'outputs' needs an 'entity'")
+                geo.add_box(b, mat)
+            report["boxes"] += 1
+
+    terrains = []
+    report["shapes"] = []
+    own_shapes = _list(spec, "shapes")
+    for i, sspec0 in enumerate(own_shapes + prefab_shapes):
+        where = (f"shapes[{i}]" if i < len(own_shapes) else f"placed shape #{i - len(own_shapes) + 1}") +             (f" '{sspec0['name']}'" if sspec0.get("name") else "")
+        for sspec in vmf_shapes.expand_repeat(sspec0, where):
+            rep = vmf_shapes.add_shape(geo, sspec, d, where, w, terrains)
+            report["io"] = report.get("io", 0) + rep.get("io", 0)
+            if rep.get("slope", 0) > 45.5:
+                w(f"{where}: the wedge's slope is {rep['slope']:.1f} deg: too steep to walk up (max ~45)")
+            report["shapes"].append({"where": where, **rep})
+    report["terrains"] = terrains
 
     # lights and nodes after all geometry, so they're never carved around
     for name, r, info, where in room_infos:
@@ -1107,33 +1339,66 @@ def build(doc, spec, warn=print):
     for name, c, info in corr_infos:
         report["lights"] += corridor_extras(geo, c, d, info)
 
-    for i, e in enumerate(_list(spec, "entities")):
-        where = f"entities[{i}]"
-        _check_keys(e, ENTITY_KEYS, where, w)
-        cls = e.get("class")
+    def terrain_z(x, y):
+        for (tx0, ty0, tx1, ty1), hfn in terrains:
+            if tx0 <= x <= tx1 and ty0 <= y <= ty1:
+                return hfn(x, y)
+        return None
+
+    own_ents = _list(spec, "entities")
+    for i, e0 in enumerate(own_ents + prefab_ents):
+        where = f"entities[{i}]" if i < len(own_ents) else f"placed entity #{i - len(own_ents) + 1}"
+        _check_keys(e0, ENTITY_KEYS, where, w)
+        cls = e0.get("class")
         if not cls:
             raise BuildError(f"{where}: needs 'class'")
-        org = _vec(e.get("origin", [0, 0, 0]), 3, where + ".origin")
-        if e.get("room"):
-            if e["room"] not in rooms:
-                raise BuildError(f"{where}: no room named {e['room']!r}")
-            ri = rooms[e["room"]]
-            org = [(ri[0] + ri[3]) / 2 + org[0], (ri[1] + ri[4]) / 2 + org[1], ri[2] + org[2]]
-        kvs = []
-        if e.get("name"):
-            kvs.append(("targetname", e["name"]))
-        ang = _angles(e, org, where)
-        if ang is not None:
-            if "look_at" in e and cls != "info_target" and not cls.startswith("point_"):
-                ang = (0, ang[1], 0)
-            kvs.append(("angles", fmt_angles(ang)))
-        if cls == "light":
-            kvs += light_kvs(float(e.get("brightness", d["light"] or 300)), e.get("color", d["light_color"]))
-        for k, v in (e.get("kv") or {}).items():
-            kvs = [kv for kv in kvs if kv[0] != k] + [(k, v)]
-        add_entity(doc, alloc, cls, kvs, tuple(num(v) for v in org),
-                   color="0 255 0" if cls == "info_player_start" else "220 30 220", visgroup=visgroup)
-        report["lights" if cls == "light" else "entities"] += 1
+        placements = []          # (spec, origin, rng or None)
+        if e0.get("scatter"):
+            base = _vec(e0.get("origin", [0, 0, 0]), 3, where + ".origin")
+            pts, rng = scatter_points(e0["scatter"], where + ".scatter", w)
+            for x, y in pts:
+                placements.append((e0, [x + base[0], y + base[1], base[2]], rng))
+        else:
+            for e in vmf_shapes.expand_repeat(e0, where):
+                placements.append((e, _vec(e.get("origin", [0, 0, 0]), 3, where + ".origin"), None))
+        for e, org, rng in placements:
+            if e.get("room"):
+                if e["room"] not in rooms:
+                    raise BuildError(f"{where}: no room named {e['room']!r}")
+                ri = rooms[e["room"]]
+                org = [(ri[0] + ri[3]) / 2 + org[0], (ri[1] + ri[4]) / 2 + org[1], ri[2] + org[2]]
+            if e.get("on_terrain"):
+                tz = terrain_z(org[0], org[1])
+                if tz is None:
+                    w(f"{where}: ({fmt_pt(org[:2] + [0])}) is on no terrain; z left at {num(org[2])}")
+                else:
+                    org = [org[0], org[1], tz + org[2]]
+            kvs = []
+            if e.get("name"):
+                kvs.append(("targetname", e["name"]))
+            if e.get("yaw") == "random":
+                r = rng or __import__("random").Random(len(placements))
+                ang = (0, num(r.uniform(0, 360)), 0)
+            else:
+                ang = _angles(e, org, where)
+            if ang is not None:
+                if "look_at" in e and cls != "info_target" and not cls.startswith("point_"):
+                    ang = (0, ang[1], 0)
+                kvs.append(("angles", fmt_angles(ang)))
+            if cls == "light":
+                kvs += light_kvs(float(e.get("brightness", d["light"] or 300)), e.get("color", d["light_color"]))
+            models = e.get("models")
+            if models:
+                r = rng or __import__("random").Random(hash(tuple(org)) & 0xFFFF)
+                kvs.append(("model", r.choice(models)))
+            elif e.get("model"):
+                kvs.append(("model", e["model"]))
+            for k, v in (e.get("kv") or {}).items():
+                kvs = [kv for kv in kvs if kv[0] != k] + [(k, v)]
+            ent = add_entity(doc, alloc, cls, kvs, tuple(num(v) for v in org),
+                             color="0 255 0" if cls == "info_player_start" else "220 30 220", visgroup=visgroup)
+            report["io"] = report.get("io", 0) + add_outputs(ent, e.get("outputs"), where)
+            report["lights" if cls == "light" else "entities"] += 1
 
     for i, v in enumerate(_list(spec, "views")):
         where = f"views[{i}]"
@@ -1263,6 +1528,13 @@ def _cmd_room(args):
         ops += [_parse_opening(t, "window") for t in args.window or []]
         ops += [_parse_opening(t, "hole") for t in args.hole or []]
         spec["openings"] = ops
+        if args.roof:
+            roof = {"style": args.roof}
+            if args.roof_axis:
+                roof["axis"] = args.roof_axis
+            if args.roof_rise is not None:
+                roof["rise"] = args.roof_rise
+            spec["roof"] = roof
         info = add_room(geo, spec, DEFAULTS, "room")
         for op in info["openings"]:
             print(f"  {op['desc']}")
@@ -1349,11 +1621,22 @@ def _cmd_build(args):
     for s in report["stairs"]:
         print(f"  stairs '{s['name']}': {s['steps']} x {num(s['rise'])} up to z {num(s['top'])}, "
               f"top end at ({fmt_pt(s['end'])})")
+    kinds = {}
+    for s in report.get("shapes", []):
+        k = kinds.setdefault(s["type"], [0, 0])
+        k[0] += 1
+        k[1] += s["brushes"]
+        if s["type"] == "terrain":
+            print(f"  terrain {s['where']}: {s['tiles']} tiles, {s['displacements']} displacement(s), "
+                  f"height {num(s['hmin'])}..{num(s['hmax'])}")
+    if kinds:
+        print("  shapes: " + ", ".join(f"{n} {t} ({b} brushes)" for t, (n, b) in sorted(kinds.items())))
     for sid, why in report["skipped"].items():
         print(f"  skipped solid id={sid}: {why} (not cut)")
     print(f"brushes: {report['added']} in the map from this build ({report['cut']} cut into "
           f"{report['pieces']} pieces); lights {report['lights']}, views {report['views']}, "
-          f"nodes {report['nodes']}, other entities {report['entities']}")
+          f"nodes {report['nodes']}, other entities {report['entities']}, I/O {report.get('io', 0)}"
+          + (f", prefab copies {report['placed']}" if report.get("placed") else ""))
     if report["warnings"]:
         print(f"{len(report['warnings'])} warning(s) above")
     if args.dry_run:
@@ -1391,6 +1674,10 @@ def add_parsers(sub):
     sp.add_argument("--window", action="append", metavar="'WALL [OFFSET [W [H [SILL]]]]'",
                     help="like --door; default 96 x 64, sill 48")
     sp.add_argument("--hole", action="append", metavar="'WALL OFFSET W H [SILL]'", help="any opening")
+    sp.add_argument("--roof", choices=("gable", "shed", "barrel", "flat"),
+                    help="put a roof on the walls (with --ceiling 0 the roof closes the room)")
+    sp.add_argument("--roof-axis", choices=("x", "y"), help="ridge direction (default: the room's long side)")
+    sp.add_argument("--roof-rise", type=float, help="ridge height above the eaves (default: a quarter of the span)")
     geom(sp)
     sp.set_defaults(func=_cmd_room)
 
