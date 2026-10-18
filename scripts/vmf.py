@@ -30,7 +30,8 @@ The module is both a library (parse/load/serialize/save + the Node/KV model +
 brush geometry) and a CLI: `python vmf.py --help` lists the read
 (stats/find/get/io-graph/refs), validate (lint/roundtrip), edit
 (set-kv/add-io/rm-io/replace-material/move) and generate (new-id/box/add-entity)
-commands, plus the visual loop from the sibling modules: render (vmf_render.py),
+commands, plus the sibling modules: blockouts room / corridor / stairs / carve /
+build / new-map (vmf_build.py) and the visual loop: render (vmf_render.py),
 compile / shoot / game-paths (vmf_game.py).
 """
 
@@ -1324,15 +1325,17 @@ def main(argv=None):
     sp.add_argument("file")
     sp.set_defaults(func=_cmd_roundtrip)
 
-    # render / compile / shoot live in sibling modules. Hand them this module
-    # instead of letting `import vmf` load a second copy of it as __main__.
+    # blockouts / render / compile / shoot live in sibling modules. Hand them this
+    # module instead of letting `import vmf` load a second copy of it as __main__.
     import os
     here = os.path.dirname(os.path.abspath(__file__))
     if here not in sys.path:
         sys.path.insert(0, here)
     sys.modules.setdefault("vmf", sys.modules[__name__])
+    import vmf_build
     import vmf_game
     import vmf_render
+    vmf_build.add_parsers(sub)
     vmf_render.add_parsers(sub)
     vmf_game.add_parsers(sub)
 

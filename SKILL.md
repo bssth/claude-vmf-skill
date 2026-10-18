@@ -1,6 +1,6 @@
 ---
 name: vmf
-description: Work with Source Engine VMF / Hammer++ map files (.vmf) — inspect, query, validate, surgically edit (keyvalues, I/O connections, materials), generate geometry (brushes, entities), and SEE the result (render a plan/side view to PNG, compile with vbsp/vvis/vrad and get leaks/errors summarised, screenshot the compiled map in the game). Use whenever a task involves reading, modifying, building, compiling or looking at a .vmf map, Hammer/Hammer++ maps, brushes/solids/sides, entity keyvalues, inputs/outputs (connections), worldspawn, displacements, targetnames, leaks, or level layout. ESSENTIAL for large maps that are too big to read into context.
+description: Work with Source Engine VMF / Hammer++ map files (.vmf) — inspect, query, validate, surgically edit (keyvalues, I/O connections, materials), generate geometry (brushes, entities, whole greybox blockouts of rooms / corridors / stairs from a JSON layout, holes carved through walls), and SEE the result (render a plan/side view to PNG, compile with vbsp/vvis/vrad and get leaks/errors summarised, screenshot the compiled map in the game). Use whenever a task involves reading, modifying, building, compiling or looking at a .vmf map, Hammer/Hammer++ maps, brushes/solids/sides, entity keyvalues, inputs/outputs (connections), worldspawn, displacements, targetnames, leaks, or level layout. ESSENTIAL for large maps that are too big to read into context.
 ---
 
 # VMF (Hammer++ map format)
@@ -20,8 +20,9 @@ surgical slices instead.
 
 ## Tooling: `scripts/vmf.py`
 
-Pure-stdlib Python 3.8+ (no dependencies; `render`/`compile`/`shoot` live in the
-sibling `vmf_render.py` / `vmf_game.py` but run through `vmf.py`). Paths below are
+Pure-stdlib Python 3.8+ (no dependencies; blockouts, `render` and
+`compile`/`shoot` live in the sibling `vmf_build.py` / `vmf_render.py` /
+`vmf_game.py` but run through `vmf.py`). Paths below are
 relative to this skill's directory; run it from anywhere with an absolute or
 relative path to the map (use whichever of `python` / `python3` / `py` works on
 the machine). The
@@ -68,6 +69,103 @@ python scripts/vmf.py box         MAP.vmf --mins -64 -64 0 --maxs 64 64 128 --ma
 python scripts/vmf.py add-entity  MAP.vmf --class logic_relay --targetname r1 --origin "0 0 0" --kv StartDisabled=0
 ```
 `box` without `--into-world` prints a `solid` block indented for pasting inside `world`.
+
+### Blockouts: build a playable greybox
+```
+python scripts/vmf.py build    LAYOUT.json OUT.vmf [--overwrite | --append] [--dry-run]   # whole blockout from JSON
+python scripts/vmf.py new-map  OUT.vmf                                                    # empty map (world only)
+python scripts/vmf.py room     MAP.vmf --mins 0 0 0 --maxs 512 384 160 [--door "east c"] [--window "north 64"]
+                               [--hole "WALL OFFSET W H [SILL]"] [--wall 16 --floor 16 --ceiling 16] [--light 300]
+python scripts/vmf.py corridor MAP.vmf --from 512 192 0 --to 768 192 0 --width 96 --height 112 [--via "X Y Z"]
+                               [--from-end auto|open|cap] [--to-end ...] [--light 120]
+python scripts/vmf.py stairs   MAP.vmf --start 1104 40 0 --dir +y (--steps 22 | --top 176) --width 96
+                               [--rise 8 --run 12 --landing 80 --no-clip]
+python scripts/vmf.py carve    MAP.vmf --mins X Y Z --maxs X Y Z [--detail]               # hole through existing brushes
+```
+`room`/`corridor`/`stairs`/`carve` edit MAP in place (all take `--dry-run`, and
+`--material` or `--wall-material`/`--floor-material`/`--ceiling-material`).
+Everything is axis-aligned boxes from `make_box` (the stair clip ramp is the one
+sloped brush), ids from the allocator, and every new brush is checked like
+`lint invalid_brushes` before anything is written.
+
+- **Rooms and corridors are given by their INTERIOR** (the air). Floor, ceiling
+  and walls are built outside it, so the floor top is the interior min z and a
+  room on the next floor starts at `ceiling top` (e.g. interior 0..160, 16 thick
+  ceiling, upper interior from 176). Rooms whose interiors are one wall apart
+  share a wall position; two walls apart = back-to-back walls.
+- **Openings** (`--door/--window/--hole`, JSON `openings`): `WALL OFFSET [WIDTH
+  [HEIGHT [SILL]]]`. WALL is north/south/east/west (= +y/-y/+x/-x). OFFSET runs
+  from the wall's inside min corner (x for north/south, y for east/west) to the
+  opening's near edge; `c` = centred, `@X` (JSON `"at"`) = centred on world
+  coordinate X. Door 64x112, window 96x64 with sill 48. An opening also cuts
+  through brushes built right behind the wall (a neighbour's back-to-back wall).
+- **corridor** points are the floor centre of the passage; each segment runs
+  along x or y (`--via` / JSON `points` for bends). An end that runs into or
+  touches a wall, or ends inside a known room, is **open** (the wall is cut
+  through); otherwise it's **capped**, so a corridor never leaks by itself.
+- **stairs** `start` = floor centre of the first step's front edge. Steps are
+  solid down to `base` (default start z), rise 8 / run 12 by default (walkable
+  up to 18), plus a `tools/toolsplayerclip` ramp through the nosings that starts
+  one run in front of the first step. It prints the top end point: the landing
+  or upper floor must continue from there at the top z.
+- **carve** splits the axis-aligned world boxes it overlaps (`--detail`: also
+  func_detail) into the boxes around the hole; each piece keeps the material
+  and texture axes of the original face pointing the same way. Sloped brushes
+  and displacements are skipped and listed.
+
+**Layout JSON** for `build` (whole-line `//` comments allowed; unknown keys are
+warned about, so typos don't pass silently):
+```
+{
+  "world":    {"skyname": "sky_day01_01"},                                   // worldspawn keys
+  "defaults": {"wall": 16, "floor": 16, "ceiling": 16, "material": "M",      // or per surface:
+               "wall_material": "DEV/DEV_MEASUREWALL01A", "floor_material": "DEV/DEV_MEASUREGENERIC01B",
+               "ceiling_material": "DEV/DEV_MEASUREGENERIC01", "stairs_material": "M", "box_material": "M",
+               "light": 300, "corridor_light": 120, "light_color": [255, 240, 220], "light_spacing": 320},
+  "visgroup": "blockout",                                                     // "" = none
+  "rooms": [{"name": "lobby", "mins": [0, 0, 0], "maxs": [512, 384, 160],    // or "size": [w, d, h]
+             "openings": [{"wall": "east", "type": "door|window|hole", "offset": 64, "at": 192,
+                           "width": 64, "height": 112, "sill": 0}],
+             "light": 300, "nodes": 128}],                                    // 0 = no light; info_node grid
+  "corridors": [{"name": "hall", "from": "lobby", "to": "stairwell", "width": 96, "height": 112, "at": 192, "z": 0},
+                {"points": [[544, 64, 0], [672, 64, 0], [672, 640, 0]], "width": 64, "height": 96,
+                 "from_end": "auto|open|cap", "to_end": "auto"}],
+  "stairs":   [{"start": [1104, 40, 0], "dir": "+y", "steps": 22, "top": 176, "rise": 8, "run": 12,
+                "width": 96, "landing": 80, "clip": true, "base": 0}],
+  "boxes":    [{"mins": [768, 304, 160], "maxs": [1056, 384, 176], "material": "M", "entity": "func_detail"}],
+  "carve":    [{"mins": [x, y, z], "maxs": [x, y, z]}],                       // e.g. a hole through a floor
+  "entities": [{"class": "info_player_start", "origin": [96, 192, 0], "yaw": 0},
+               {"class": "npc_citizen", "room": "office", "origin": [64, 0, 0], "look_at": [0, 0, 0], "name": "bob",
+                "kv": {"spawnflags": "0"}},
+               {"class": "light", "origin": [960, 160, 112], "brightness": 200, "color": [255, 255, 255]}],
+  "views":    [{"name": "stairs", "pos": [1104, 8, 64], "look_at": [1104, 384, 200]},   // pos = EYE
+               {"room": "lobby", "corner": "sw|se|nw|ne"}]
+}
+```
+- Corridor `from`/`to` are room names (a straight corridor between their facing
+  walls, centred on their overlap unless `at`; `z` needed when the floors
+  differ) or points. Entity `room` makes `origin` relative to that room's floor
+  centre. `look_at` / `yaw` / `pitch` / `angles` set angles (`look_at` only
+  turns the yaw, except on info_target / point_*). Views become `info_target`s named
+  `shot_<name>`, which `shoot` picks up; a `room` view stands in a corner at eye
+  height looking at the room's centre.
+- Build order: all room shells, then room openings, corridors, `carve`, stairs,
+  boxes, automatic lights (rooms: a grid with one per `light_spacing` cell, a
+  third of the way down from the ceiling; corridors: dimmer) and nodes, then
+  entities and views. So carves never cut stairs or boxes, and a door between
+  back-to-back rooms goes through both walls.
+- It prints each room, the corridor end states (open/cap), where each stair run
+  ends, and a WARN for every opening or open corridor end that leads to no room
+  (that's a leak: put a room or a sealed box behind it).
+
+**The blockout loop**: sketch on the grid first (player 32 wide, 72 tall, eyes
+at 64; doors 64x112; corridors >= 64 wide, 96 comfortable; rooms 128-192 high)
+→ `build --dry-run` until there are no warnings → `build --overwrite` → `lint` →
+`render --cut Z` for each floor and a side view through the stairs and
+corridors → `compile` (no leak) → `shoot` (start view + `shot_*` views) → look,
+fix the JSON, rebuild. Rebuilding replaces the file, so keep changes in the
+JSON, not in Hammer, until the layout settles; `--append` puts a layout into an
+existing map once (run it again and you get a second copy).
 
 ### See it: render → compile → shoot
 You can't judge geometry from coordinates. Look at it, then open the PNG/JPGs
@@ -121,6 +219,11 @@ python scripts/vmf.py game-paths [MAP.vmf]     # which tools / game dir / hl2.ex
 - Reading, counting, searching, I/O graph → **always vmf.py** (never raw Read).
 - Validation before a vbsp compile → **vmf.py lint**.
 - Generating geometry/entities → **vmf.py** (computing planes/uaxis by hand silently breaks convexity & normals).
+- A new space / level / greybox from a description → **a layout JSON + `build`**
+  into a new map, then the blockout loop. One room, corridor or stair run added
+  to an existing map → **`room` / `corridor` / `stairs`** with `--dry-run` first.
+- A door, window or stairwell hole through existing walls / floors → **`carve`**
+  (axis-aligned brushes only; it lists what it couldn't cut).
 - Changing a keyvalue / I/O on entities → **vmf.py set-kv / add-io / rm-io** (safe with repeated keys; preview with `--dry-run`).
 - A one-off change to a single, textually-unique line you already located → a manual **Edit** is fine.
 - **After building or moving geometry → render and look** (plan with `--cut`, a
@@ -130,6 +233,8 @@ python scripts/vmf.py game-paths [MAP.vmf]     # which tools / game dir / hl2.ex
   just "it compiled".
 - Work on a **copy** when experimenting: compile writes `.bsp/.prt/.lin/.log`
   next to the map, and the user's own maps may have uncommitted Hammer work.
+  `shoot` installs the bsp into `<game>/maps`: delete it there when you're done
+  with a throwaway map.
 
 ## Gotchas
 
@@ -142,6 +247,8 @@ python scripts/vmf.py game-paths [MAP.vmf]     # which tools / game dir / hl2.ex
 - `move` does not apply texture lock; textures shift relative to moved geometry (acceptable for most edits, re-align if it matters).
 - Plane winding: vbsp's outward normal is `(p0-p1) x (p2-p1)`, so `(p1-p0) x (p2-p0)` points INTO the brush. Get it backwards and the brush silently vanishes from the compile. Details in [reference/format.md](reference/format.md).
 - `hidden { ... }` blocks (objects hidden with H in Hammer) are not compiled by vbsp; the tools skip them too.
+- An opening in an outer wall with nothing behind it (a window onto the void) leaks. `build` warns about each one; `room` can't know what's outside, so check with `compile`.
+- `render --slice A B` also draws brushes that just touch A or B: to look through a corridor or stair run from the side, inset the slice a few units (`--slice 1064 1144` for stairs spanning 1056..1152).
 - `shoot` drives the game with `hl2.exe -hijack` (console commands sent to the running instance) and `-condebug` (`console.log` in the game dir). If someone is using the machine, the game window grabs focus when it starts; input is zeroed during the shots, so that's harmless.
 
 ## After editing
