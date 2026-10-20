@@ -648,10 +648,15 @@ def _cmd_shoot(args):
             return dpos > 2 or dang > 2
 
         for i, v in enumerate(views):
-            for attempt in range(3):
+            # A view's own commands may move the camera on purpose (walk tests,
+            # lifts, teleports), and a retake would re-place it without them:
+            # shoot those views once, wherever the commands took the camera.
+            moves = bool(v.get("cmds"))
+            attempts = 1 if moves else 3
+            for attempt in range(attempts):
                 got, cam = take(v, with_cmds=(attempt == 0))
-                if got is None or cam is None or not off_by(v, cam):
-                    break
+                if got is None or cam is None or not off_by(v, cam) or attempt == attempts - 1:
+                    break  # the last attempt's shot is kept even if it drifted
                 os.remove(os.path.join(shots_dir, got))  # the camera drifted; shoot again
             if got is None:
                 results.append((v, None))
@@ -665,7 +670,8 @@ def _cmd_shoot(args):
             if cam:
                 where = "  eye (%s %s %s) ang (%s %s %s)" % tuple(_fmt(round(c, 1)) for c in cam)
                 if off_by(v, cam):
-                    where += "  WARN: camera is not where the view asked for"
+                    where += ("  (moved by the view's commands)" if moves
+                              else "  WARN: camera is not where the view asked for")
             print(f"  {v['name']}: {dst}{where}", flush=True)
     except RuntimeError as e:
         print(f"ERROR: {e}", file=sys.stderr)

@@ -339,8 +339,8 @@ python scripts/vmf.py game-paths [MAP.vmf]     # which tools / game dir / hl2.ex
 - **shoot**: starts the game windowed on the compiled map, freezes AI and input,
   hides HUD/viewmodel, moves a noclip camera to each view and saves one JPG per
   view to `--out` (default `./shots_<map>`). Each line reports the camera's real
-  eye position/angles (read back with `getpos`) and the shot is retaken if the
-  camera drifted. Views are EYE positions + Source angles (pitch down-positive,
+  eye position/angles (read back with `getpos`) and a plain view is shot again
+  (up to 3 times) if the camera drifted. Views are EYE positions + Source angles (pitch down-positive,
   yaw CCW from +X): a file of `name x y z pitch yaw [roll]` lines, `--view`, or
   automatic: player start looking 4 ways + every `point_viewcontrol` + every
   entity named `shot_*` (drop an `info_target` named `shot_<what>` with `angles`
@@ -353,6 +353,15 @@ python scripts/vmf.py game-paths [MAP.vmf]     # which tools / game dir / hl2.ex
   that contain `( ) ' :` (`ent_fire s runscriptcode "Go()"`): the console
   tokenizer splits on them. Outputs a command triggers run a tick later than
   the next `ent_fire` in the same view: check their results in the next view.
+  A view with commands is shot once, wherever its commands left the camera
+  (its line says "moved by the view's commands"), so it can test movement: a
+  **walk test** `"walk 528 2470 -2664 0 90 | noclip; +forward"` turns noclip
+  off (setup turned it on) and walks for `--cmd-wait` s; the reported eye is
+  where the player got to. Put the eye a few units above standing height so
+  the player drops onto the floor (at exactly standing height `setpos` reports
+  "setpos into world"), and release the key in the next view (`| -forward`).
+  Time things with `--cmd-wait` rather than the console's `wait`, which counts
+  frames, so its length in seconds depends on the frame rate.
   Needs Steam running and the game closed; takes
   ~20 s to load plus ~1 s per view. Restores `cfg/config.cfg` afterwards.
   `--fullbright` for maps compiled with `--no-rad`.
